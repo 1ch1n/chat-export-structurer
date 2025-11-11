@@ -31,7 +31,7 @@ def iso_from_epoch(ts):
     if ts is None or ts == 0:
         return None
     try:
-        return datetime.datetime.fromtimestamp(float(ts), datetime.UTC).replace(microsecond=0).isoformat()
+        return datetime.datetime.fromtimestamp(float(ts), datetime.timezone.utc).replace(microsecond=0).isoformat()
     except Exception:
         return None
 

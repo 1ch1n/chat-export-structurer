@@ -14,7 +14,7 @@ If you're building with AI, you know the problem: every conversation starts from
 
 This tool is the foundation. A clean, local-first parser that turns messy AI exports into structured SQLite archives—ready for search, RAG, agents, or whatever you're building next.
 
-**Part of [MyChatArchive](https://mychatarchive.com)** — a full platform for AI memory and context. Launching Q1 2025.
+**Part of [MyChatArchive](https://mychatarchive.com)** — a full platform for AI memory and context. Launching Q1 2026.
 
 ---
 

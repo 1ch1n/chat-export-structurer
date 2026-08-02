@@ -451,7 +451,8 @@ def get_profile(
     return json.dumps(out, indent=2)
 
 
-def run(db_path: Path | None = None, transport: str = "stdio", port: int = 8420):
+def run(db_path: Path | None = None, transport: str = "stdio", port: int = 8420,
+        ssl_certfile: str | None = None, ssl_keyfile: str | None = None):
     """Start the MCP server."""
     if db_path:
         global _con
@@ -459,6 +460,28 @@ def run(db_path: Path | None = None, transport: str = "stdio", port: int = 8420)
 
     if transport == "sse":
         print(f"Starting MCP server with SSE transport on port {port}", file=sys.stderr)
-        mcp.run(transport="sse", port=port)
+        mcp.settings.port = port
+        if ssl_certfile or ssl_keyfile:
+            import anyio
+            import uvicorn
+
+            # Disable localhost-only DNS rebinding protection so LAN clients can connect.
+            # Safe here because we're using a proper mkcert cert over HTTPS on a private LAN.
+            mcp.settings.transport_security.enable_dns_rebinding_protection = False
+
+            async def _run():
+                config = uvicorn.Config(
+                    mcp.sse_app(),
+                    host="0.0.0.0",
+                    port=port,
+                    log_level=mcp.settings.log_level.lower(),
+                    ssl_certfile=ssl_certfile,
+                    ssl_keyfile=ssl_keyfile,
+                )
+                await uvicorn.Server(config).serve()
+
+            anyio.run(_run)
+        else:
+            mcp.run(transport="sse")
     else:
         mcp.run(transport="stdio")

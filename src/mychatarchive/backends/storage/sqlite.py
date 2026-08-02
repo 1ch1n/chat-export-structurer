@@ -5,10 +5,14 @@ All data lives in a single .sqlite file with FTS5 and vector search via sqlite-v
 
 import json
 import re
-import sqlite3
 import struct
 from pathlib import Path
 from typing import Optional
+
+try:
+    import pysqlite3 as sqlite3  # NAS/embedded: pip install pysqlite3-binary
+except ImportError:
+    import sqlite3
 
 import sqlite_vec
 

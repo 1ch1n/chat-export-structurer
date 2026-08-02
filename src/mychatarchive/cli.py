@@ -226,6 +226,18 @@ def main():
         default=8420,
         help="Port for SSE transport (default: 8420)",
     )
+    serve_p.add_argument(
+        "--ssl-certfile",
+        default=None,
+        metavar="PATH",
+        help="Path to TLS certificate PEM file (enables HTTPS)",
+    )
+    serve_p.add_argument(
+        "--ssl-keyfile",
+        default=None,
+        metavar="PATH",
+        help="Path to TLS private key PEM file",
+    )
     _add_db_arg(serve_p)
 
     # --- search ---
@@ -940,7 +952,13 @@ def _cmd_serve(args, db_path: Path):
         transport = get_transport()
 
     from mychatarchive.mcp.server import run
-    run(db_path=db_path, transport=transport, port=args.port)
+    run(
+        db_path=db_path,
+        transport=transport,
+        port=args.port,
+        ssl_certfile=getattr(args, "ssl_certfile", None),
+        ssl_keyfile=getattr(args, "ssl_keyfile", None),
+    )
 
 
 def _cmd_search(args, db_path: Path):

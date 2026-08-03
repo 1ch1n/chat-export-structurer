@@ -8,6 +8,7 @@ Commands:
     mychatarchive embed               Generate vector embeddings
     mychatarchive summarize           Generate LLM summaries for all threads
     mychatarchive groups              Manage thread groups (list/create/add/remove)
+    mychatarchive classify            Set sensitivity levels (public/private/sealed)
     mychatarchive serve               Start MCP server
     mychatarchive search <query>      Search from the command line
     mychatarchive info                Show archive stats
@@ -30,6 +31,16 @@ def _add_db_arg(parser):
         default=None,
         help=f"Path to SQLite database (default: {get_db_path()})",
     )
+
+
+def _cli_scope(args) -> tuple:
+    """Resolve --include-private/--include-sealed flags into a sensitivity scope."""
+    if getattr(args, "include_sealed", False):
+        print("WARNING: including SEALED content in output.", file=sys.stderr)
+        return ("public", "private", "sealed")
+    if getattr(args, "include_private", False):
+        return ("public", "private")
+    return ("public",)
 
 
 def main():
@@ -116,6 +127,14 @@ def main():
         "--include-thoughts", action="store_true",
         help="Include captured thoughts in the export",
     )
+    export_p.add_argument(
+        "--include-private", action="store_true",
+        help="Include content classified as private (default: public only)",
+    )
+    export_p.add_argument(
+        "--include-sealed", action="store_true",
+        help="Include SEALED content (implies --include-private; prints a warning)",
+    )
     _add_db_arg(export_p)
 
     # --- embed ---
@@ -171,6 +190,12 @@ def main():
         metavar="N",
         help="Messages per summary segment. Threads with more messages get multiple summaries. Default: 15.",
     )
+    summarize_p.add_argument(
+        "--include-private",
+        action="store_true",
+        help="Also summarize private threads (sends their text to the LLM API). "
+             "Sealed threads are never summarized.",
+    )
     _add_db_arg(summarize_p)
 
     # --- groups ---
@@ -211,6 +236,46 @@ def main():
     groups_show.add_argument("name", help="Group name")
     groups_show.add_argument("--limit", type=int, default=50, help="Max threads to show")
     _add_db_arg(groups_show)
+
+    # --- classify ---
+    classify_p = sub.add_parser(
+        "classify",
+        help="Set sensitivity levels (public/private/sealed) so agents only retrieve what you allow",
+    )
+    classify_sel = classify_p.add_mutually_exclusive_group(required=True)
+    classify_sel.add_argument(
+        "--thread", metavar="THREAD_ID",
+        help="Classify one thread (applies immediately)",
+    )
+    classify_sel.add_argument(
+        "--query", metavar="TEXT",
+        help="Bulk-classify every thread containing a keyword match (preview first; apply with --confirm)",
+    )
+    classify_sel.add_argument(
+        "--before", metavar="YYYY-MM-DD",
+        help="Bulk-classify threads whose last message predates this date (preview first; apply with --confirm)",
+    )
+    classify_sel.add_argument(
+        "--list", action="store_true", dest="list_counts",
+        help="Show row counts per sensitivity level",
+    )
+    classify_p.add_argument(
+        "--level", choices=["public", "private", "sealed"], default=None,
+        help="Sensitivity level to apply (required except with --list)",
+    )
+    classify_p.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview what would change without applying (bulk selectors preview by default)",
+    )
+    classify_p.add_argument(
+        "--confirm", action="store_true",
+        help="Actually apply a bulk classification (--query/--before never apply without this)",
+    )
+    classify_p.add_argument(
+        "--limit", type=int, default=500,
+        help="Max threads to show in a bulk preview (default: 500)",
+    )
+    _add_db_arg(classify_p)
 
     # --- serve ---
     serve_p = sub.add_parser("serve", help="Start MCP server")
@@ -281,6 +346,14 @@ def main():
         metavar="GROUP",
         help="Filter to threads in this group (see 'mychatarchive groups list')",
     )
+    search_p.add_argument(
+        "--include-private", action="store_true",
+        help="Include content classified as private (default: public only)",
+    )
+    search_p.add_argument(
+        "--include-sealed", action="store_true",
+        help="Include SEALED content (implies --include-private; prints a warning)",
+    )
     _add_db_arg(search_p)
 
     # --- info ---
@@ -325,6 +398,8 @@ def main():
         _cmd_summarize(args, db_path)
     elif args.command == "groups":
         _cmd_groups(args, db_path)
+    elif args.command == "classify":
+        _cmd_classify(args, db_path)
     elif args.command == "serve":
         _cmd_serve(args, db_path)
     elif args.command == "search":
@@ -693,8 +768,36 @@ def _cmd_export(args, db_path: Path):
 
     from mychatarchive import db
 
+    scope = _cli_scope(args)
+
     if fmt == "sqlite":
+        # A file copy carries EVERYTHING — every table, including sealed rows
+        # and their vectors. It cannot be filtered, so it is refused when
+        # sealed content exists unless the caller explicitly opts in.
         import shutil
+        con = db.get_connection(db_path)
+        db.ensure_schema(con)
+        has_sealed = db.sealed_exists(con)
+        if has_sealed and not args.include_sealed:
+            con.close()
+            print(
+                "This archive contains SEALED content, and a SQLite copy cannot "
+                "be filtered — the file carries every row. Re-run with "
+                "--include-sealed to copy anyway, or use --format json/csv for "
+                "a filtered export.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if "private" not in scope or has_sealed:
+            print(
+                "Note: a SQLite copy includes ALL content regardless of "
+                "sensitivity flags (private" + (" and sealed" if has_sealed else "")
+                + " rows are in the file).",
+                file=sys.stderr,
+            )
+        # Flush WAL frames into the main file so the copy is complete.
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        con.close()
         shutil.copy2(str(db_path), str(output_path))
         print(f"Database copied to {output_path}")
         size_mb = output_path.stat().st_size / (1024 * 1024)
@@ -702,10 +805,11 @@ def _cmd_export(args, db_path: Path):
         return
 
     con = db.get_connection(db_path)
-    messages = db.export_messages(con, platform=args.platform)
+    db.ensure_schema(con)
+    messages = db.export_messages(con, platform=args.platform, scope=scope)
     thoughts = []
     if args.include_thoughts:
-        thoughts = db.export_thoughts(con)
+        thoughts = db.export_thoughts(con, scope=scope)
     con.close()
 
     if fmt == "json":
@@ -729,7 +833,8 @@ def _cmd_export(args, db_path: Path):
             writer = csv.DictWriter(
                 f,
                 fieldnames=["message_id", "thread_id", "platform", "account_id",
-                            "timestamp", "role", "content", "title", "source_id"],
+                            "timestamp", "role", "content", "title", "source_id",
+                            "sensitivity"],
             )
             writer.writeheader()
             writer.writerows(messages)
@@ -792,6 +897,7 @@ def _cmd_summarize(args, db_path: Path):
             limit=args.limit,
             embed_summaries=not args.no_embed,
             messages_per_segment=messages_per_segment,
+            include_private=getattr(args, "include_private", False),
         )
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -941,6 +1047,124 @@ def _cmd_groups_list(db_path: Path):
     print("  mychatarchive search 'query' --group <name>  search within a group")
 
 
+def _cmd_classify(args, db_path: Path):
+    if not db_path.exists():
+        print(f"No database found at {db_path}. Import chats first.", file=sys.stderr)
+        sys.exit(1)
+
+    from mychatarchive import db
+
+    con = db.get_connection(db_path)
+    db.ensure_schema(con)  # write path — also the migration trigger
+
+    if args.list_counts:
+        counts = db.sensitivity_counts(con)
+        con.close()
+        print(f"Sensitivity levels - {db_path}")
+        print(f"{'-' * 60}")
+        header = f"  {'':<18}{'public':>10}{'private':>10}{'sealed':>10}"
+        print(header)
+        for label, key in (("Threads", "threads"), ("Messages", "messages"),
+                           ("Thoughts", "thoughts"), ("Summaries", "thread_summaries")):
+            row = counts[key]
+            print(f"  {label:<18}{row.get('public', 0):>10,}"
+                  f"{row.get('private', 0):>10,}{row.get('sealed', 0):>10,}")
+        print()
+        print("Commands:")
+        print("  mychatarchive classify --thread <id> --level private")
+        print("  mychatarchive classify --query 'text' --level sealed --confirm")
+        print("  mychatarchive classify --before 2023-01-01 --level private --confirm")
+        return
+
+    if not args.level:
+        print("--level is required (public, private, or sealed).", file=sys.stderr)
+        con.close()
+        sys.exit(1)
+
+    def _warn_if_sealed():
+        if args.level == "sealed":
+            print(
+                "WARNING: sealed content is never returned by the MCP server and "
+                "is hidden from search/export unless you pass --include-sealed.",
+                file=sys.stderr,
+            )
+
+    if args.thread:
+        current = db.get_thread_sensitivity(con, args.thread)
+        if current is None:
+            print(f"Thread '{args.thread}' not found.", file=sys.stderr)
+            con.close()
+            sys.exit(1)
+        _warn_if_sealed()
+        counts = db.set_thread_sensitivity(con, [args.thread], args.level)
+        con.close()
+        print(f"Thread {args.thread}: {current[0]} -> {args.level}")
+        print(f"  Updated: {counts['messages']} messages, {counts['chunks']} chunks, "
+              f"{counts['thread_summaries']} summary segments")
+        return
+
+    # Bulk selectors: --query / --before. Preview by default, apply only
+    # with --confirm — this is how six years of backlog get classified
+    # without reading them, so it must never fire by accident.
+    if args.query:
+        # Classification tooling must see everything, or already-classified
+        # content could never be re-classified.
+        matches = db.fts_search(con, args.query, limit=10000,
+                                scope=db.SENSITIVITY_LEVELS)
+        thread_ids = sorted({row[2] for row in matches})
+        selector_desc = f"threads with keyword match for {args.query!r}"
+    else:
+        import datetime
+        try:
+            datetime.datetime.strptime(args.before, "%Y-%m-%d")
+        except ValueError:
+            print("Invalid --before format. Use YYYY-MM-DD.", file=sys.stderr)
+            con.close()
+            sys.exit(1)
+        thread_ids = db.threads_before(con, args.before)
+        selector_desc = f"threads whose last message predates {args.before}"
+
+    if not thread_ids:
+        print(f"No {selector_desc}. Nothing to do.")
+        con.close()
+        return
+
+    # Preview: level distribution + a capped listing.
+    print(f"{len(thread_ids):,} {selector_desc}")
+    print(f"{'-' * 60}")
+    shown = 0
+    total_msgs = 0
+    for tid in thread_ids:
+        info = db.get_thread_sensitivity(con, tid)
+        if info is None:
+            continue
+        level, msg_count = info
+        total_msgs += msg_count
+        if shown < args.limit:
+            print(f"  {tid}  [{level}, {msg_count} msgs]")
+            shown += 1
+    if shown < len(thread_ids):
+        print(f"  ... and {len(thread_ids) - shown:,} more (raise --limit to see them)")
+    print()
+    print(f"Would set {len(thread_ids):,} threads / {total_msgs:,} messages "
+          f"(plus their chunks and summaries) to '{args.level}'.")
+
+    if args.dry_run or not args.confirm:
+        con.close()
+        if args.dry_run:
+            print("\nDry run - nothing changed.")
+        else:
+            print("\nPreview only - re-run with --confirm to apply.")
+        return
+
+    _warn_if_sealed()
+    counts = db.set_thread_sensitivity(con, thread_ids, args.level)
+    con.close()
+    print(f"\nApplied '{args.level}' to {len(thread_ids):,} threads: "
+          f"{counts['messages']:,} messages, {counts['chunks']:,} chunks, "
+          f"{counts['thread_summaries']:,} summary segments.")
+
+
 def _cmd_serve(args, db_path: Path):
     if not db_path.exists():
         print(f"No database found at {db_path}. Import and embed chats first.", file=sys.stderr)
@@ -971,6 +1195,8 @@ def _cmd_search(args, db_path: Path):
     import datetime
 
     con = db.get_connection(db_path)
+    db.ensure_schema(con)
+    scope = _cli_scope(args)
     platform = args.platform if args.platform else None
     sort_by_time = args.sort == "time"
 
@@ -1009,7 +1235,7 @@ def _cmd_search(args, db_path: Path):
         results = db.search_chunks(
             con, embedding, limit=args.limit, platform=platform,
             cutoff_iso=cutoff_iso, sort_by_time=sort_by_time,
-            group_thread_ids=group_thread_ids,
+            group_thread_ids=group_thread_ids, scope=scope,
         )
 
         if not results:
@@ -1018,7 +1244,7 @@ def _cmd_search(args, db_path: Path):
             return
 
         for i, (chunk_id, distance) in enumerate(results, 1):
-            row = db.get_chunk_by_id(con, chunk_id)
+            row = db.get_chunk_by_id(con, chunk_id, scope=scope)
             if row:
                 meta = json.loads(row[4]) if row[4] else {}
                 similarity = round(1.0 - distance, 4)
@@ -1032,7 +1258,7 @@ def _cmd_search(args, db_path: Path):
         results = db.fts_search(
             con, query, limit=args.limit, platform=platform,
             cutoff_iso=cutoff_iso, sort_by_time=sort_by_time,
-            group_thread_ids=group_thread_ids,
+            group_thread_ids=group_thread_ids, scope=scope,
         )
         if not results:
             print("No results found.")
@@ -1071,6 +1297,12 @@ def _cmd_info(db_path: Path):
         platforms = db.platform_counts(con)
     except Exception:
         platforms = []
+    # Guarded like platform_counts: the plain-sqlite3 fallback connection may
+    # be a pre-v3 archive with no sensitivity column.
+    try:
+        sens_threads = db.sensitivity_counts(con).get("threads", {})
+    except Exception:
+        sens_threads = {}
     con.close()
 
     print(f"MyChatArchive - {db_path}")
@@ -1081,6 +1313,9 @@ def _cmd_info(db_path: Path):
     print(f"  Embedded:    {chunks:,} chunks")
     print(f"  Thoughts:    {thoughts:,}")
     print(f"  Groups:      {groups:,}")
+    if sens_threads:
+        parts = [f"{level}: {n:,}" for level, n in sorted(sens_threads.items())]
+        print(f"  Sensitivity: {' | '.join(parts)} (threads)")
     if platforms:
         print(f"  Platforms:")
         for plat, count in platforms:

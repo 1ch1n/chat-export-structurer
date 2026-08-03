@@ -11,6 +11,14 @@ from typing import Optional
 
 from mychatarchive.backends import get_storage
 
+# Sensitivity levels, least to most restricted. Duplicated here (not imported
+# from a backend) so callers can reference them without eagerly importing a
+# storage backend — backends load lazily by design.
+SENSITIVITY_LEVELS = ("public", "private", "sealed")
+
+# Fail-closed default: callers that don't name a scope see public rows only.
+DEFAULT_SCOPE = ("public",)
+
 
 def _b():
     return get_storage()
@@ -57,8 +65,8 @@ def platform_counts(con) -> list[tuple[str, int]]:
     return _b().platform_counts(con)
 
 
-def iter_messages(con, batch_size: int = 1000):
-    return _b().iter_messages(con, batch_size)
+def iter_messages(con, batch_size: int = 1000, *, scope: tuple = DEFAULT_SCOPE):
+    return _b().iter_messages(con, batch_size, scope=scope)
 
 
 def embedded_message_ids(con) -> set[str]:
@@ -73,16 +81,18 @@ def clear_chunks(con) -> None:
 def insert_chunk(con, chunk_id: str, message_id: Optional[str],
                  thread_id: str, chunk_index: int, text: str,
                  ts_start: str, ts_end: str, embedding: list[float],
-                 meta: Optional[dict] = None):
+                 meta: Optional[dict] = None, *, sensitivity: str = "public"):
     return _b().insert_chunk(
         con, chunk_id, message_id, thread_id, chunk_index,
-        text, ts_start, ts_end, embedding, meta,
+        text, ts_start, ts_end, embedding, meta, sensitivity=sensitivity,
     )
 
 
 def insert_thought(con, thought_id: str, text: str, created_at: str,
-                   embedding: list[float], meta: Optional[dict] = None):
-    return _b().insert_thought(con, thought_id, text, created_at, embedding, meta)
+                   embedding: list[float], meta: Optional[dict] = None,
+                   *, sensitivity: str = "public"):
+    return _b().insert_thought(con, thought_id, text, created_at, embedding, meta,
+                               sensitivity=sensitivity)
 
 
 def search_chunks(
@@ -93,16 +103,19 @@ def search_chunks(
     cutoff_iso: str | None = None,
     sort_by_time: bool = False,
     group_thread_ids: set | None = None,
+    *,
+    scope: tuple = DEFAULT_SCOPE,
 ):
     return _b().search_chunks(
         con, embedding, limit=limit, platform=platform,
         cutoff_iso=cutoff_iso, sort_by_time=sort_by_time,
-        group_thread_ids=group_thread_ids,
+        group_thread_ids=group_thread_ids, scope=scope,
     )
 
 
-def search_thoughts(con, embedding: list[float], limit: int = 10):
-    return _b().search_thoughts(con, embedding, limit)
+def search_thoughts(con, embedding: list[float], limit: int = 10, *,
+                    scope: tuple = DEFAULT_SCOPE):
+    return _b().search_thoughts(con, embedding, limit, scope=scope)
 
 
 def fts_search(
@@ -113,11 +126,13 @@ def fts_search(
     cutoff_iso: str | None = None,
     sort_by_time: bool = False,
     group_thread_ids: set | None = None,
+    *,
+    scope: tuple = DEFAULT_SCOPE,
 ):
     return _b().fts_search(
         con, query, limit=limit, platform=platform,
         cutoff_iso=cutoff_iso, sort_by_time=sort_by_time,
-        group_thread_ids=group_thread_ids,
+        group_thread_ids=group_thread_ids, scope=scope,
     )
 
 
@@ -126,38 +141,43 @@ def get_recent_chunks(
     cutoff_iso: str,
     limit: int = 20,
     platform: str | list[str] | None = None,
+    *,
+    scope: tuple = DEFAULT_SCOPE,
 ):
-    return _b().get_recent_chunks(con, cutoff_iso, limit=limit, platform=platform)
+    return _b().get_recent_chunks(con, cutoff_iso, limit=limit, platform=platform, scope=scope)
 
 
-def get_recent_thoughts(con, cutoff_iso: str, limit: int = 20):
-    return _b().get_recent_thoughts(con, cutoff_iso, limit)
+def get_recent_thoughts(con, cutoff_iso: str, limit: int = 20, *,
+                        scope: tuple = DEFAULT_SCOPE):
+    return _b().get_recent_thoughts(con, cutoff_iso, limit, scope=scope)
 
 
-def get_chunk_by_id(con, chunk_id: str):
-    return _b().get_chunk_by_id(con, chunk_id)
+def get_chunk_by_id(con, chunk_id: str, *, scope: tuple = DEFAULT_SCOPE):
+    return _b().get_chunk_by_id(con, chunk_id, scope=scope)
 
 
-def get_thought_by_id(con, thought_id: str):
-    return _b().get_thought_by_id(con, thought_id)
+def get_thought_by_id(con, thought_id: str, *, scope: tuple = DEFAULT_SCOPE):
+    return _b().get_thought_by_id(con, thought_id, scope=scope)
 
 
-def export_messages(con, platform: str | None = None, limit: int | None = None):
-    return _b().export_messages(con, platform=platform, limit=limit)
+def export_messages(con, platform: str | None = None, limit: int | None = None,
+                    *, scope: tuple = DEFAULT_SCOPE):
+    return _b().export_messages(con, platform=platform, limit=limit, scope=scope)
 
 
-def export_thoughts(con):
-    return _b().export_thoughts(con)
+def export_thoughts(con, *, scope: tuple = DEFAULT_SCOPE):
+    return _b().export_thoughts(con, scope=scope)
 
 
 # ── Thread summaries ──────────────────────────────────────────────────────────
 
-def iter_threads(con):
-    return _b().iter_threads(con)
+def iter_threads(con, *, scope: tuple = DEFAULT_SCOPE):
+    return _b().iter_threads(con, scope=scope)
 
 
-def get_thread_messages(con, canonical_thread_id: str) -> list[dict]:
-    return _b().get_thread_messages(con, canonical_thread_id)
+def get_thread_messages(con, canonical_thread_id: str, *,
+                        scope: tuple = DEFAULT_SCOPE) -> list[dict]:
+    return _b().get_thread_messages(con, canonical_thread_id, scope=scope)
 
 
 def has_thread_summary(con, canonical_thread_id: str) -> bool:
@@ -179,10 +199,13 @@ def insert_thread_summary(
     key_topics: list,
     summary_model: str,
     now: str,
+    *,
+    sensitivity: str = "public",
 ):
     return _b().insert_thread_summary(
         con, summary_id, canonical_thread_id, segment_index, title, platform,
         message_count, segment_chars, ts_start, ts_end, summary, key_topics, summary_model, now,
+        sensitivity=sensitivity,
     )
 
 
@@ -195,34 +218,38 @@ def delete_thread_summaries(con, canonical_thread_id: str) -> int:
     return _b().delete_thread_summaries(con, canonical_thread_id)
 
 
-def get_thread_summary(con, canonical_thread_id: str):
+def get_thread_summary(con, canonical_thread_id: str, *, scope: tuple = DEFAULT_SCOPE):
     """Returns the first segment (segment_index=0) for a thread using the 10-col layout, or None."""
-    return _b().get_thread_summary(con, canonical_thread_id)
+    return _b().get_thread_summary(con, canonical_thread_id, scope=scope)
 
 
-def get_thread_summaries(con, canonical_thread_id: str) -> list:
+def get_thread_summaries(con, canonical_thread_id: str, *,
+                         scope: tuple = DEFAULT_SCOPE) -> list:
     """Return all segments for a thread in segment_index order (10-col layout).
 
     10-col: summary_id[0], canonical_thread_id[1], segment_index[2], title[3],
     platform[4], message_count[5], ts_start[6], ts_end[7], summary[8], key_topics[9].
     """
-    return _b().get_thread_summaries(con, canonical_thread_id)
+    return _b().get_thread_summaries(con, canonical_thread_id, scope=scope)
 
 
-def get_summary_by_id(con, summary_id: str):
+def get_summary_by_id(con, summary_id: str, *, scope: tuple = DEFAULT_SCOPE):
     """Fetch a single segment by summary_id using the 10-col layout."""
-    return _b().get_summary_by_id(con, summary_id)
+    return _b().get_summary_by_id(con, summary_id, scope=scope)
 
 
-def list_thread_summaries(con, limit: int = 100, platform=None, since_iso=None):
+def list_thread_summaries(con, limit: int = 100, platform=None, since_iso=None,
+                          *, scope: tuple = DEFAULT_SCOPE):
     """10-col layout: summary_id[0], canonical_thread_id[1], segment_index[2], title[3],
     platform[4], message_count[5], ts_start[6], ts_end[7], summary[8], key_topics[9]."""
-    return _b().list_thread_summaries(con, limit=limit, platform=platform, since_iso=since_iso)
+    return _b().list_thread_summaries(con, limit=limit, platform=platform,
+                                      since_iso=since_iso, scope=scope)
 
 
-def search_thread_summaries(con, embedding: list[float], limit: int = 10):
+def search_thread_summaries(con, embedding: list[float], limit: int = 10, *,
+                            scope: tuple = DEFAULT_SCOPE):
     """Returns [(summary_id, distance)]."""
-    return _b().search_thread_summaries(con, embedding, limit)
+    return _b().search_thread_summaries(con, embedding, limit, scope=scope)
 
 
 def summary_count(con) -> int:
@@ -265,8 +292,9 @@ def delete_group(con, group_id: str) -> bool:
     return _b().delete_group(con, group_id)
 
 
-def get_threads_in_group(con, group_id: str) -> list[dict]:
-    return _b().get_threads_in_group(con, group_id)
+def get_threads_in_group(con, group_id: str, *,
+                         scope: tuple = DEFAULT_SCOPE) -> list[dict]:
+    return _b().get_threads_in_group(con, group_id, scope=scope)
 
 
 def get_group_thread_ids(con, group_id: str) -> set:
@@ -275,3 +303,34 @@ def get_group_thread_ids(con, group_id: str) -> set:
 
 def group_count(con) -> int:
     return _b().group_count(con)
+
+
+# ── Sensitivity classification ────────────────────────────────────────────────
+
+def set_thread_sensitivity(con, thread_ids: list, level: str) -> dict:
+    """Set the level for whole threads across messages/chunks/summaries."""
+    return _b().set_thread_sensitivity(con, thread_ids, level)
+
+
+def get_thread_sensitivity(con, canonical_thread_id: str):
+    """Return (effective_level, message_count) for a thread, or None."""
+    return _b().get_thread_sensitivity(con, canonical_thread_id)
+
+
+def sensitivity_counts(con) -> dict:
+    """Per-level counts for messages, threads, thoughts, and summaries."""
+    return _b().sensitivity_counts(con)
+
+
+def sealed_exists(con) -> bool:
+    return _b().sealed_exists(con)
+
+
+def threads_before(con, cutoff_iso: str) -> list:
+    """Thread ids whose last message predates cutoff_iso."""
+    return _b().threads_before(con, cutoff_iso)
+
+
+def reconcile_thread_sensitivity(con) -> int:
+    """Raise newly ingested rows to their thread's already-classified level."""
+    return _b().reconcile_thread_sensitivity(con)

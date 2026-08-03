@@ -1241,7 +1241,7 @@ def get_threads_in_group(con: sqlite3.Connection, group_id: str, *,
     max_allowed_rank = max(
         {"public": 0, "private": 1, "sealed": 2}[s] for s in scope
     )
-    rows = con.execute(f"""
+    rows = con.execute("""
         SELECT m.canonical_thread_id,
                MAX(msgs.platform) AS platform,
                MAX(msgs.title) AS title,

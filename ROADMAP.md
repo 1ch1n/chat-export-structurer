@@ -82,7 +82,7 @@ A personal AI memory system that compounds from daily usage. Start with searchab
 **Goal:** The AI has your full context -- memory, calendar, projects, patterns -- and acts on it.
 
 - [ ] Read/write loop: MCP-connected conversations auto-capture back to archive
-- [ ] Privacy flags (private vs work-safe)
+- [x] Sensitivity levels: public / private / sealed, fail-closed retrieval (`mychatarchive classify`, v0.4.0)
 - [ ] Calendar integration (MCP server or direct)
 - [ ] Project context linking (connect archive threads to repos/projects)
 - [ ] Proactive context surfacing (AI suggests relevant history before you ask)

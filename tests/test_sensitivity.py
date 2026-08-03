@@ -2,7 +2,6 @@
 populated database, fail-closed scope defaults across the data access layer,
 and thread-level classification helpers."""
 
-import tempfile
 from pathlib import Path
 
 import pytest

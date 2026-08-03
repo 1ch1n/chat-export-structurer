@@ -177,6 +177,41 @@ Note: Claude mobile's Connectors require OAuth. On the same home WiFi (no VPN ne
 
 ---
 
+## Upgrading: sensitivity migration (v0.4.0)
+
+v0.4.0 adds a `sensitivity` column to every content table. The migration runs
+automatically on first open, takes a verified backup first, and is idempotent —
+but on a production NAS archive, run it deliberately rather than letting the
+server trigger it mid-request:
+
+```bash
+# 1. Stop the server
+kill $(cat /volume1/Knowledgebase/mychatarchive/mychatarchive.pid)
+
+# 2. Pull the new version
+cd /volume1/Knowledgebase/mychatarchive/app && git pull && pip3 install -e ".[dev]"
+
+# 3. Trigger the migration explicitly (any command that opens the db works;
+#    this one also shows you the resulting counts)
+mychatarchive classify --list --db /volume1/Knowledgebase/mychatarchive/archive.db
+
+# 4. Verify the automatic backup exists next to the archive
+ls -lh /volume1/Knowledgebase/mychatarchive/archive.pre-v3-*.backup.sqlite
+
+# 5. Restart
+/volume1/Knowledgebase/mychatarchive/start-mcp.sh
+```
+
+Notes:
+
+- The backup is a full copy of the database, written to the same volume —
+  make sure there is enough free space (same size as `archive.db`).
+- Every existing row defaults to `public`; nothing changes behavior until you
+  classify threads.
+- Once verified, the `*.backup.sqlite` file can be moved elsewhere or deleted.
+
+---
+
 ## Cert renewal
 
 mkcert certs are valid ~2 years. When they expire:

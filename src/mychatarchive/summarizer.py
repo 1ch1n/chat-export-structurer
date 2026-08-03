@@ -172,11 +172,16 @@ def run(
     limit: int | None = None,
     embed_summaries: bool = True,
     messages_per_segment: int = _DEFAULT_MESSAGES_PER_SEGMENT,
+    include_private: bool = False,
 ) -> dict:
     """Generate LLM summaries for all unsummarized threads.
 
     Long threads are split into segments of messages_per_segment messages each.
     Each segment gets its own summary row and embedding in the DB.
+
+    Summarization sends raw thread text to an external LLM API — the one place
+    archive content leaves the machine. Sealed threads are never summarized;
+    private threads only with include_private=True.
 
     Args:
         db_path:              Path to archive.db
@@ -187,6 +192,8 @@ def run(
         limit:                Max threads to process in this run
         embed_summaries:      Also embed summaries for thread-level semantic search
         messages_per_segment: Messages per summary segment (default: 15)
+        include_private:      Also summarize private threads (sealed never leaves
+                              the machine regardless)
 
     Returns:
         {"processed": N, "skipped": N, "errors": N, "total_threads": N, "segments": N}
@@ -210,10 +217,12 @@ def run(
 
     now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-    # Collect threads to process
-    threads = list(db.iter_threads(con))
+    # Collect threads to process. Scope is explicit egress control: this is
+    # the only path that ships raw archive text to an external API.
+    scope = ("public", "private") if include_private else ("public",)
+    threads = list(db.iter_threads(con, scope=scope))
     total = len(threads)
-    print(f"  [summarize] {total:,} threads in archive", file=sys.stderr)
+    print(f"  [summarize] {total:,} threads in scope {list(scope)}", file=sys.stderr)
 
     if not force:
         threads = [t for t in threads if not db.has_thread_summary(con, t["canonical_thread_id"])]
@@ -251,7 +260,7 @@ def run(
     for thread_meta in iterator:
         thread_id = thread_meta["canonical_thread_id"]
         try:
-            messages = db.get_thread_messages(con, thread_id)
+            messages = db.get_thread_messages(con, thread_id, scope=scope)
             if not messages:
                 continue
 
@@ -288,6 +297,7 @@ def run(
                     key_topics=key_topics,
                     summary_model=model,
                     now=now_str,
+                    sensitivity=thread_meta.get("sensitivity", "public"),
                 )
 
                 if embedder:

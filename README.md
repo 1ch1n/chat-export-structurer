@@ -223,7 +223,7 @@ The `group` filter works on `search_brain`, `get_context`, `get_profile`, and th
 
 ## Sensitivity Levels
 
-Six years of chat history contains things an agent should not surface on any random turn -- medical conversations, personal spirals, private notes. Classify threads into three levels and the archive enforces them in the data access layer:
+Years of chat history contain things an agent should not surface on any random turn -- sensitive work, personal matters, private notes. Classify threads into three levels and the archive enforces them in the data access layer:
 
 | Level | Behavior |
 |-------|----------|
@@ -239,8 +239,8 @@ mychatarchive classify --list
 mychatarchive classify --thread <id> --level private
 
 # Bulk-classify by keyword -- previews first, applies only with --confirm
-mychatarchive classify --query "medical" --level sealed
-mychatarchive classify --query "medical" --level sealed --confirm
+mychatarchive classify --query "project-x" --level sealed
+mychatarchive classify --query "project-x" --level sealed --confirm
 
 # Bulk-classify old threads (last message before a date)
 mychatarchive classify --before 2022-01-01 --level private --confirm

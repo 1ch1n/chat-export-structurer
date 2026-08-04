@@ -42,9 +42,9 @@ def _seeded_db(tmp_path):
     db_file = tmp_path / "archive.db"
     con = store.get_connection(db_file)
     store.ensure_schema(con)
-    store.insert_message(con, "m1", "t-med", "chatgpt", "main",
+    store.insert_message(con, "m1", "t-px", "chatgpt", "main",
                          "2024-01-01T00:00:00", "user",
-                         "my medical appointment", "Medical", "s")
+                         "planning the project-x rollout", "Project X", "s")
     store.insert_message(con, "m2", "t-code", "chatgpt", "main",
                          "2024-06-01T00:00:00", "user",
                          "rust borrow checker", "Code", "s")
@@ -56,7 +56,7 @@ def _seeded_db(tmp_path):
 def test_classify_query_never_applies_without_confirm(tmp_path, monkeypatch, capsys):
     db_file = _seeded_db(tmp_path)
 
-    _run(["classify", "--query", "medical", "--level", "sealed",
+    _run(["classify", "--query", "project-x", "--level", "sealed",
           "--db", str(db_file)], monkeypatch)
     out = capsys.readouterr().out
     assert "Preview only" in out
@@ -74,7 +74,7 @@ def test_classify_query_never_applies_without_confirm(tmp_path, monkeypatch, cap
 def test_classify_query_applies_with_confirm(tmp_path, monkeypatch, capsys):
     db_file = _seeded_db(tmp_path)
 
-    _run(["classify", "--query", "medical", "--level", "sealed", "--confirm",
+    _run(["classify", "--query", "project-x", "--level", "sealed", "--confirm",
           "--db", str(db_file)], monkeypatch)
     assert "Applied 'sealed' to 1 threads" in capsys.readouterr().out
 
@@ -83,13 +83,13 @@ def test_classify_query_applies_with_confirm(tmp_path, monkeypatch, capsys):
         "SELECT canonical_thread_id, sensitivity FROM messages"
     ).fetchall())
     con.close()
-    assert rows == {"t-med": "sealed", "t-code": "public"}
+    assert rows == {"t-px": "sealed", "t-code": "public"}
 
 
 def test_classify_dry_run_wins_over_confirm(tmp_path, monkeypatch, capsys):
     db_file = _seeded_db(tmp_path)
 
-    _run(["classify", "--query", "medical", "--level", "sealed",
+    _run(["classify", "--query", "project-x", "--level", "sealed",
           "--confirm", "--dry-run", "--db", str(db_file)], monkeypatch)
     assert "Dry run" in capsys.readouterr().out
     con = sqlite3.connect(db_file)
@@ -110,12 +110,12 @@ def test_classify_before_is_thread_scoped_on_last_message(tmp_path, monkeypatch,
         "SELECT canonical_thread_id, sensitivity FROM messages"
     ).fetchall())
     con.close()
-    assert rows == {"t-med": "private", "t-code": "public"}
+    assert rows == {"t-px": "private", "t-code": "public"}
 
 
 def test_sqlite_export_refuses_sealed_without_flag(tmp_path, monkeypatch, capsys):
     db_file = _seeded_db(tmp_path)
-    _run(["classify", "--thread", "t-med", "--level", "sealed",
+    _run(["classify", "--thread", "t-px", "--level", "sealed",
           "--db", str(db_file)], monkeypatch)
     capsys.readouterr()
 

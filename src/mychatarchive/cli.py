@@ -1104,8 +1104,8 @@ def _cmd_classify(args, db_path: Path):
         return
 
     # Bulk selectors: --query / --before. Preview by default, apply only
-    # with --confirm — this is how six years of backlog get classified
-    # without reading them, so it must never fire by accident.
+    # with --confirm — this is how a large backlog gets classified without
+    # reading it, so it must never fire by accident.
     if args.query:
         # Classification tooling must see everything, or already-classified
         # content could never be re-classified.

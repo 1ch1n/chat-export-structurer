@@ -37,7 +37,7 @@ the core install (import, full-text search, MCP) is now light enough for
 `uvx mychatarchive`. Existing v0.2.0 archives migrate in place on first
 open.
 
-**v0.4.0 — the archive learns to keep secrets.** An archive that holds six
+**v0.4.0 — the archive learns to keep secrets.** An archive that holds
 years of everything is only safe to connect to agents if it can withhold
 things. This release adds three sensitivity levels — public, private,
 sealed — enforced in the data access layer with a fail-closed default: any

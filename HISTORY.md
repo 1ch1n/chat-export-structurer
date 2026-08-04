@@ -36,3 +36,18 @@ torch/sentence-transformers stack moved to an optional `[local]` extra —
 the core install (import, full-text search, MCP) is now light enough for
 `uvx mychatarchive`. Existing v0.2.0 archives migrate in place on first
 open.
+
+**v0.4.0 — the archive learns to keep secrets.** An archive that holds
+years of everything is only safe to connect to agents if it can withhold
+things. This release adds three sensitivity levels — public, private,
+sealed — enforced in the data access layer with a fail-closed default: any
+retrieval call that doesn't name a scope gets public content only, and
+sealed content cannot be expressed or returned through the MCP server at
+all. Behavior change to know about: `search` and `export` now return
+public content only unless you pass `--include-private`/`--include-sealed`
+(before this release there was no distinction, so nothing is hidden that
+you didn't classify yourself). The migration ALTERs a populated database in
+place, so it takes a verified backup first (`*.pre-v3-*.backup.sqlite`
+beside the archive) and refuses to run without one. Deliberately not in
+this release: model-assisted auto-classification and encryption at rest —
+both worth doing, neither belongs in the same change as a schema migration.

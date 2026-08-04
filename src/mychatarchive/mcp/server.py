@@ -27,6 +27,34 @@ mcp = FastMCP("mychatarchive")
 _con = None
 
 
+def _ensure_migrated(con) -> None:
+    """Migrate the archive on open (pre-v3 archives gain the sensitivity column).
+
+    Read paths never ran ensure_schema before v0.4.0; scope-filtered SQL needs
+    the column, so serve must migrate too. If the file is not writable (e.g. a
+    read-only mount), proceed only when the archive is already current.
+    """
+    try:
+        db.ensure_schema(con)
+    except Exception as exc:
+        try:
+            row = con.execute(
+                "SELECT value FROM archive_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            version = int(row[0]) if row else 0
+        except Exception:
+            version = 0
+        if version >= 3:
+            print(f"Warning: schema maintenance failed ({exc}); archive is "
+                  f"already v{version}, continuing read-only.", file=sys.stderr)
+            return
+        raise RuntimeError(
+            f"This archive needs the v3 sensitivity migration but it could not "
+            f"be applied here ({exc}). Run 'mychatarchive classify --list "
+            f"--db <path>' on the host with write access, then restart."
+        ) from exc
+
+
 def _get_con():
     global _con
     if _con is None:
@@ -38,7 +66,19 @@ def _get_con():
             )
             raise FileNotFoundError(f"No database at {db_path}")
         _con = db.get_connection(db_path)
+        _ensure_migrated(_con)
     return _con
+
+
+# The MCP surface can express at most public+private. Sealed does not appear
+# here at all — no parameter value reaches a scope containing it, and this
+# allowlist strips it defensively even if a future edit widens the input.
+_MCP_ALLOWED_LEVELS = ("public", "private")
+
+
+def _scope(include_private: bool) -> tuple:
+    scope = ("public", "private") if include_private else ("public",)
+    return tuple(s for s in scope if s in _MCP_ALLOWED_LEVELS)
 
 
 def _lazy_embed(text: str) -> list[float]:
@@ -86,6 +126,7 @@ def search_brain(
     since: str | None = None,
     sort_by_time: bool = False,
     group: str | None = None,
+    include_private: bool = False,
 ) -> str:
     """Semantic search across all chat history by meaning.
 
@@ -101,8 +142,12 @@ def search_brain(
         since: Only include messages from this date (YYYY-MM-DD)
         sort_by_time: If true, sort by newest first instead of relevance
         group: Filter to threads in this user-curated group (e.g. "jarvis", "coding")
+        include_private: Also search content the user has classified as private.
+            Default false — only set this when the user explicitly asks for
+            private material.
     """
     con = _get_con()
+    scope = _scope(include_private)
     embedding = _lazy_embed(query)
     platforms = [p.strip() for p in platform.split(",")] if platform else None
     group_thread_ids = _resolve_group_thread_ids(con, group)
@@ -123,7 +168,7 @@ def search_brain(
     results = db.search_chunks(
         con, embedding, limit=limit, platform=platforms,
         cutoff_iso=cutoff_iso, sort_by_time=sort_by_time,
-        group_thread_ids=group_thread_ids,
+        group_thread_ids=group_thread_ids, scope=scope,
     )
 
     if not results:
@@ -132,7 +177,7 @@ def search_brain(
 
     output = []
     for chunk_id, distance in results:
-        row = db.get_chunk_by_id(con, chunk_id)
+        row = db.get_chunk_by_id(con, chunk_id, scope=scope)
         if row:
             meta = json.loads(row[4]) if row[4] else {}
             output.append({
@@ -153,6 +198,7 @@ def search_recent(
     hours: int = 24,
     limit: int = 20,
     platform: str | None = None,
+    include_private: bool = False,
 ) -> str:
     """Retrieve recent conversations and captured thoughts by time range.
 
@@ -161,15 +207,18 @@ def search_recent(
         limit: Maximum results per category (default 20)
         platform: Filter by platform (chatgpt, anthropic, grok, claude_code, cursor).
             Comma-separated for multiple. Omit for all.
+        include_private: Also include content the user has classified as private.
+            Default false — only set this when the user explicitly asks.
     """
     con = _get_con()
+    scope = _scope(include_private)
     cutoff = (
         datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
     ).isoformat()
     platforms = [p.strip() for p in platform.split(",")] if platform else None
 
-    chunk_rows = db.get_recent_chunks(con, cutoff, limit, platform=platforms)
-    thought_rows = db.get_recent_thoughts(con, cutoff, limit)
+    chunk_rows = db.get_recent_chunks(con, cutoff, limit, platform=platforms, scope=scope)
+    thought_rows = db.get_recent_thoughts(con, cutoff, limit, scope=scope)
 
     messages = []
     for row in chunk_rows:
@@ -204,6 +253,7 @@ def get_context(
     since: str | None = None,
     sort_by_time: bool = False,
     group: str | None = None,
+    include_private: bool = False,
 ) -> str:
     """Given a topic, return a comprehensive context bundle.
 
@@ -219,8 +269,11 @@ def get_context(
         since: Only include messages from this date (YYYY-MM-DD)
         sort_by_time: If true, sort by newest first instead of relevance
         group: Filter to threads in this user-curated group (e.g. "jarvis", "coding")
+        include_private: Also include content the user has classified as private.
+            Default false — only set this when the user explicitly asks.
     """
     con = _get_con()
+    scope = _scope(include_private)
     embedding = _lazy_embed(topic)
     platforms = [p.strip() for p in platform.split(",")] if platform else None
     group_thread_ids = _resolve_group_thread_ids(con, group)
@@ -242,14 +295,14 @@ def get_context(
     chunk_results = db.search_chunks(
         con, embedding, limit=limit, platform=platforms,
         cutoff_iso=cutoff_iso, sort_by_time=sort_by_time,
-        group_thread_ids=group_thread_ids,
+        group_thread_ids=group_thread_ids, scope=scope,
     )
-    thought_results = db.search_thoughts(con, embedding, limit=5)
+    thought_results = db.search_thoughts(con, embedding, limit=5, scope=scope)
 
     related_messages = []
     thread_ids = set()
     for chunk_id, distance in chunk_results:
-        row = db.get_chunk_by_id(con, chunk_id)
+        row = db.get_chunk_by_id(con, chunk_id, scope=scope)
         if row:
             meta = json.loads(row[4]) if row[4] else {}
             related_messages.append({
@@ -268,7 +321,7 @@ def get_context(
     #         platform[4], message_count[5], ts_start[6], ts_end[7], summary[8], key_topics[9]
     thread_summaries_out = []
     for tid in list(thread_ids)[:5]:
-        segs = db.get_thread_summaries(con, tid)
+        segs = db.get_thread_summaries(con, tid, scope=scope)
         if not segs:
             continue
         # Merge all segments into a single thread-level summary
@@ -304,7 +357,7 @@ def get_context(
 
     related_thoughts = []
     for thought_id, distance in thought_results:
-        row = db.get_thought_by_id(con, thought_id)
+        row = db.get_thought_by_id(con, thought_id, scope=scope)
         if row:
             related_thoughts.append({
                 "text": row[0],
@@ -324,7 +377,7 @@ def get_context(
 
 
 @mcp.tool()
-def capture_thought(thought: str, tags: str = "") -> str:
+def capture_thought(thought: str, tags: str = "", sensitivity: str = "public") -> str:
     """Capture a new thought or note into your archive with auto-embedding.
 
     The thought is stored and embedded so it's retrievable via search_brain later.
@@ -333,7 +386,20 @@ def capture_thought(thought: str, tags: str = "") -> str:
     Args:
         thought: The thought or note to capture
         tags: Optional comma-separated tags for organization
+        sensitivity: "public" (default) or "private". Private thoughts are only
+            returned when a retrieval call sets include_private. ("sealed" is
+            managed from the CLI, never over MCP.)
     """
+    if sensitivity not in _MCP_ALLOWED_LEVELS:
+        # Sealing over MCP is rejected by design: an agent sealing content it
+        # just wrote would make it invisible to its own session, and sealed
+        # stays CLI-only end to end.
+        return json.dumps({
+            "error": f"sensitivity must be one of {list(_MCP_ALLOWED_LEVELS)}; "
+                     f"sealed content is managed via the mychatarchive CLI.",
+            **_current_datetime_json(),
+        })
+
     con = _get_con()
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     thought_id = hashlib.sha1(f"{now}|{thought[:64]}".encode()).hexdigest()
@@ -341,7 +407,8 @@ def capture_thought(thought: str, tags: str = "") -> str:
     embedding = _lazy_embed(thought)
     meta = {"tags": [t.strip() for t in tags.split(",") if t.strip()]} if tags else None
 
-    db.insert_thought(con, thought_id, thought, now, embedding, meta)
+    db.insert_thought(con, thought_id, thought, now, embedding, meta,
+                      sensitivity=sensitivity)
     con.commit()
 
     out = {
@@ -359,6 +426,7 @@ def get_profile(
     days_back: int = 30,
     platform: str | None = None,
     group: str | None = None,
+    include_private: bool = False,
 ) -> str:
     """Get a snapshot of the user's current context: active projects, themes, recent focus.
 
@@ -370,8 +438,11 @@ def get_profile(
         days_back: How many days of history to include (default 30)
         platform: Filter by platform (chatgpt, anthropic, grok, claude_code, cursor)
         group: Filter to threads in a specific group (e.g. "jarvis", "coding")
+        include_private: Also include content the user has classified as private.
+            Default false — only set this when the user explicitly asks.
     """
     con = _get_con()
+    scope = _scope(include_private)
     cutoff = (
         datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days_back)
     ).isoformat()
@@ -382,7 +453,7 @@ def get_profile(
     # 10-col layout: summary_id[0], canonical_thread_id[1], segment_index[2], title[3],
     #                platform[4], message_count[5], ts_start[6], ts_end[7], summary[8], key_topics[9]
     recent_summaries_raw = db.list_thread_summaries(
-        con, limit=20, platform=platform, since_iso=cutoff
+        con, limit=20, platform=platforms, since_iso=cutoff, scope=scope
     )
     thread_summaries = []
     for row in recent_summaries_raw:
@@ -400,7 +471,7 @@ def get_profile(
         })
 
     # 2. Recent message chunks (always include — fallback if no summaries)
-    chunk_rows = db.get_recent_chunks(con, cutoff, limit=15, platform=platforms)
+    chunk_rows = db.get_recent_chunks(con, cutoff, limit=15, platform=platforms, scope=scope)
     recent_messages = []
     seen_threads: set[str] = set()
     for row in chunk_rows:
@@ -418,7 +489,7 @@ def get_profile(
         })
 
     # 3. Recent captured thoughts
-    thought_rows = db.get_recent_thoughts(con, cutoff, limit=10)
+    thought_rows = db.get_recent_thoughts(con, cutoff, limit=10, scope=scope)
     thoughts = [{"text": r[1], "created_at": r[2]} for r in thought_rows]
 
     # 4. Aggregate key topics from summaries for a "focus areas" view
@@ -457,6 +528,7 @@ def run(db_path: Path | None = None, transport: str = "stdio", port: int = 8420,
     if db_path:
         global _con
         _con = db.get_connection(db_path)
+        _ensure_migrated(_con)
 
     if transport == "sse":
         print(f"Starting MCP server with SSE transport on port {port}", file=sys.stderr)

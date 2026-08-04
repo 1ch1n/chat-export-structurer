@@ -4,6 +4,7 @@
 
 | Version | Supported          |
 |---------|--------------------|
+| 0.4.x   | Yes                |
 | 0.3.x   | Yes                |
 | < 0.3   | No — upgrade; archives migrate in place on first open |
 
@@ -42,6 +43,17 @@ MyChatArchive is a local-first tool. The primary attack surface includes:
   forwards archive content — including MCP clients and LLMs consuming search
   results — is a trust boundary: imported text can contain adversarial
   instructions aimed at whatever reads it.
+- **Sensitivity levels are access control, not encryption.** As of v0.4.0,
+  content can be classified public / private / sealed. Enforcement happens in
+  the data access layer and fails closed to public; sealed content cannot be
+  expressed or retrieved through the MCP server at all, and `summarize` never
+  sends sealed (or, by default, private) content to an external API. The
+  limits: sealed text still exists unencrypted in the SQLite file, its FTS
+  index, and its vector tables, and `export --format sqlite` copies the whole
+  file (it is refused when sealed rows exist unless explicitly overridden).
+  Filesystem permissions on the database remain the control that matters.
+  If you believe you have found a path that returns sealed content through
+  the MCP server, report it as a vulnerability.
 
 ## Best Practices
 

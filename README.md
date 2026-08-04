@@ -221,6 +221,47 @@ The `group` filter works on `search_brain`, `get_context`, `get_profile`, and th
 
 ---
 
+## Sensitivity Levels
+
+Years of chat history contain things an agent should not surface on any random turn -- sensitive work, personal matters, private notes. Classify threads into three levels and the archive enforces them in the data access layer:
+
+| Level | Behavior |
+|-------|----------|
+| `public` | Default. Returned by every search and MCP tool. |
+| `private` | Returned only when a caller explicitly opts in (`include_private` on MCP tools, `--include-private` on the CLI). |
+| `sealed` | **Never returned by the MCP server, under any circumstances.** CLI-only, and only with an explicit `--include-sealed` flag. |
+
+```bash
+# See where you stand
+mychatarchive classify --list
+
+# Classify one thread (applies immediately)
+mychatarchive classify --thread <id> --level private
+
+# Bulk-classify by keyword -- previews first, applies only with --confirm
+mychatarchive classify --query "project-x" --level sealed
+mychatarchive classify --query "project-x" --level sealed --confirm
+
+# Bulk-classify old threads (last message before a date)
+mychatarchive classify --before 2022-01-01 --level private --confirm
+
+# Search honors levels
+mychatarchive search "query"                    # public only
+mychatarchive search "query" --include-private
+mychatarchive search "query" --include-sealed   # prints a warning
+```
+
+Details worth knowing:
+
+- Enforcement lives in the data access layer, not in tool handlers. A retrieval call that doesn't name a scope fails closed to public -- including third-party integrations that use `mychatarchive.db` directly.
+- Bulk classification is thread-scoped: one matching message classifies the whole conversation, which is how sensitivity works in practice.
+- `mychatarchive summarize` (the one command that sends content to an external LLM API) summarizes public threads only by default; `--include-private` opts in, and sealed threads never leave the machine.
+- Re-running `sync` on a classified thread is safe: newly imported messages inherit the thread's level before anything can read them.
+- Existing archives migrate automatically on first use -- every row defaults to `public`, and a verified backup (`*.pre-v3-*.backup.sqlite`) is written next to the database before the schema changes.
+- Sealed content is hidden, not encrypted: the text still exists in the SQLite file, its FTS index, and its vectors. Protect the file itself with filesystem permissions. Encryption at rest is a possible future addition.
+
+---
+
 ## Search from the CLI
 
 ```bash
@@ -361,6 +402,10 @@ Named sources (NAS, custom paths)     --+              |
 | `mychatarchive groups add <group> <ids...>` | Add threads to a group |
 | `mychatarchive groups show <name>` | Show threads in a group |
 | `mychatarchive groups delete <name>` | Delete a group (threads are not deleted) |
+| `mychatarchive classify --list` | Show sensitivity counts per level |
+| `mychatarchive classify --thread <id> --level <l>` | Classify a thread (public/private/sealed) |
+| `mychatarchive classify --query <text> --level <l> --confirm` | Bulk-classify threads by keyword |
+| `mychatarchive classify --before <date> --level <l> --confirm` | Bulk-classify threads by age |
 | `mychatarchive embed` | Generate vector embeddings |
 | `mychatarchive export <output>` | Export to JSON, CSV, or SQLite copy |
 | `mychatarchive serve` | Start MCP server |
@@ -447,6 +492,7 @@ Override with `--db /path/to/your.db` on any command, or set a custom drop folde
 - [x] Export (JSON, CSV, SQLite copy)
 - [x] SSE transport for remote MCP access
 - [x] One-command sync with auto-discovery + drop folder + named sources
+- [x] Sensitivity levels: public / private / sealed with fail-closed retrieval (`mychatarchive classify`)
 - [ ] Additional parsers (Gemini, Perplexity, Copilot)
 - [ ] Grouping UI (browse threads and assign to groups without knowing thread IDs)
 - [ ] Analysis engine (deep prompts against your full archive)

@@ -3,6 +3,7 @@
 All data lives in a single .sqlite file with FTS5 and vector search via sqlite-vec.
 """
 
+import datetime
 import json
 import re
 import struct
@@ -24,6 +25,44 @@ def _get_embedding_dim() -> int:
 
 def serialize_f32(vec: list[float]) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
+
+
+# Sensitivity levels, least to most restricted. Rows default to 'public';
+# 'private' requires callers to opt in; 'sealed' is never served over MCP.
+SENSITIVITY_LEVELS = ("public", "private", "sealed")
+
+_DEFAULT_SCOPE = ("public",)
+
+
+def _validate_scope(scope) -> tuple:
+    """Validate a sensitivity scope, returning it as a tuple.
+
+    Raises ValueError on unknown levels so a typo can never widen access.
+    """
+    scope = tuple(scope)
+    if not scope:
+        raise ValueError("sensitivity scope must not be empty")
+    unknown = [s for s in scope if s not in SENSITIVITY_LEVELS]
+    if unknown:
+        raise ValueError(
+            f"Unknown sensitivity level(s) {unknown}; valid: {list(SENSITIVITY_LEVELS)}"
+        )
+    return scope
+
+
+def _validate_level(level: str) -> str:
+    if level not in SENSITIVITY_LEVELS:
+        raise ValueError(
+            f"Unknown sensitivity level '{level}'; valid: {list(SENSITIVITY_LEVELS)}"
+        )
+    return level
+
+
+def _scope_sql(scope, column: str = "sensitivity") -> tuple[str, tuple]:
+    """Return an 'IN (?,...)' predicate + params for a validated scope."""
+    scope = _validate_scope(scope)
+    placeholders = ",".join("?" * len(scope))
+    return f"{column} IN ({placeholders})", scope
 
 
 def get_connection(db_path: Path) -> sqlite3.Connection:
@@ -66,7 +105,9 @@ def _ensure_thread_summaries_v2(con: sqlite3.Connection, dim: int) -> None:
                     key_topics TEXT,
                     summary_model TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    sensitivity TEXT NOT NULL DEFAULT 'public'
+                        CHECK(sensitivity IN ('public','private','sealed'))
                 );
                 INSERT INTO thread_summaries_new
                     (summary_id, canonical_thread_id, segment_index, title, platform,
@@ -98,7 +139,9 @@ def _ensure_thread_summaries_v2(con: sqlite3.Connection, dim: int) -> None:
                     key_topics TEXT,
                     summary_model TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    sensitivity TEXT NOT NULL DEFAULT 'public'
+                        CHECK(sensitivity IN ('public','private','sealed'))
                 )
             """)
         # Drop old vec table (wrong PK: canonical_thread_id) and recreate with summary_id
@@ -121,7 +164,7 @@ def _ensure_thread_summaries_v2(con: sqlite3.Connection, dim: int) -> None:
     con.commit()
 
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 
 def _detect_existing_vec_dim(con: sqlite3.Connection) -> Optional[int]:
@@ -263,6 +306,76 @@ def _ensure_messages_fts_v2(con: sqlite3.Connection) -> None:
     con.commit()
 
 
+_SENSITIVITY_TABLES = ("messages", "chunks", "thoughts", "thread_summaries")
+
+
+def _ensure_sensitivity_v3(con: sqlite3.Connection) -> None:
+    """Add the sensitivity column to all content tables (schema v3). Idempotent.
+
+    On a populated archive this is the only migration that ALTERs in place, so
+    it backs the database file up first (sqlite backup API — a plain file copy
+    would drop uncommitted WAL frames) and refuses to migrate if the backup
+    cannot be verified. Fresh archives get the column from the CREATE DDL and
+    never reach the backup path.
+    """
+    missing = []
+    for table in _SENSITIVITY_TABLES:
+        cols = {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+        if cols and "sensitivity" not in cols:
+            missing.append(table)
+
+    if missing:
+        db_file = None
+        for _, name, path in con.execute("PRAGMA database_list").fetchall():
+            if name == "main" and path:
+                db_file = Path(path)
+                break
+
+        if db_file is not None:
+            stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            backup_path = db_file.with_name(f"{db_file.stem}.pre-v3-{stamp}.backup.sqlite")
+            dest = sqlite3.connect(str(backup_path))
+            try:
+                con.backup(dest)
+            finally:
+                dest.close()
+            if not backup_path.exists() or backup_path.stat().st_size == 0:
+                raise RuntimeError(
+                    f"Pre-migration backup verification failed at {backup_path}; "
+                    f"refusing to migrate. Free disk space and retry."
+                )
+
+        con.commit()  # close any implicit transaction before BEGIN IMMEDIATE
+        con.execute("BEGIN IMMEDIATE")  # serialize concurrent openers (serve + CLI)
+        for table in missing:
+            cols = {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "sensitivity" in cols:
+                continue  # another process migrated while we waited on the lock
+            con.execute(f"""
+                ALTER TABLE {table} ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'public'
+                    CHECK(sensitivity IN ('public','private','sealed'))
+            """)
+        con.execute(
+            "INSERT OR REPLACE INTO archive_meta (key, value) VALUES ('schema_version', ?)",
+            (SCHEMA_VERSION,),
+        )
+        con.commit()
+
+    # Idempotent index maintenance (all paths, including fresh installs).
+    # Partial indexes: archives are overwhelmingly public, so index only the
+    # exceptions — powers sealed_exists() and classify --list cheaply.
+    for table in _SENSITIVITY_TABLES:
+        con.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_{table}_sensitivity
+            ON {table}(sensitivity) WHERE sensitivity != 'public'
+        """)
+    # Thread-level classify UPDATEs chunks by thread; chunks had no thread index.
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chunks_thread ON chunks(canonical_thread_id)"
+    )
+    con.commit()
+
+
 def ensure_schema(con: sqlite3.Connection):
     """Create all tables (ingestion + brain). Idempotent.
 
@@ -283,7 +396,9 @@ def ensure_schema(con: sqlite3.Connection):
             role TEXT NOT NULL,
             text TEXT NOT NULL,
             title TEXT,
-            source_id TEXT NOT NULL
+            source_id TEXT NOT NULL,
+            sensitivity TEXT NOT NULL DEFAULT 'public'
+                CHECK(sensitivity IN ('public','private','sealed'))
         );
 
         CREATE TABLE IF NOT EXISTS chunks (
@@ -294,14 +409,18 @@ def ensure_schema(con: sqlite3.Connection):
             text TEXT NOT NULL,
             ts_start TEXT,
             ts_end TEXT,
-            meta TEXT
+            meta TEXT,
+            sensitivity TEXT NOT NULL DEFAULT 'public'
+                CHECK(sensitivity IN ('public','private','sealed'))
         );
 
         CREATE TABLE IF NOT EXISTS thoughts (
             thought_id TEXT PRIMARY KEY,
             text TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            meta TEXT
+            meta TEXT,
+            sensitivity TEXT NOT NULL DEFAULT 'public'
+                CHECK(sensitivity IN ('public','private','sealed'))
         );
 
         -- User-curated thread groups (e.g. "jarvis", "coding", "projects").
@@ -356,6 +475,10 @@ def ensure_schema(con: sqlite3.Connection):
     # Thread summaries: create or migrate to multi-segment schema
     _ensure_thread_summaries_v2(con, dim)
 
+    # Sensitivity column (schema v3). MUST run last: _ensure_thread_summaries_v2
+    # table-rewrites thread_summaries and would drop a column added earlier.
+    _ensure_sensitivity_v3(con)
+
 
 # --- Ingestion ---
 
@@ -409,12 +532,14 @@ def platform_counts(con: sqlite3.Connection) -> list[tuple[str, int]]:
 
 # --- Iterators ---
 
-def iter_messages(con: sqlite3.Connection, batch_size: int = 1000):
+def iter_messages(con: sqlite3.Connection, batch_size: int = 1000, *,
+                  scope: tuple = _DEFAULT_SCOPE):
+    scope_sql, scope_params = _scope_sql(scope)
     cur = con.cursor()
-    cur.execute("""
-        SELECT message_id, canonical_thread_id, ts, role, text, title
-        FROM messages ORDER BY canonical_thread_id, ts
-    """)
+    cur.execute(f"""
+        SELECT message_id, canonical_thread_id, ts, role, text, title, sensitivity
+        FROM messages WHERE {scope_sql} ORDER BY canonical_thread_id, ts
+    """, scope_params)
     while True:
         rows = cur.fetchmany(batch_size)
         if not rows:
@@ -427,6 +552,7 @@ def iter_messages(con: sqlite3.Connection, batch_size: int = 1000):
                 "role": row[3],
                 "text": row[4],
                 "title": row[5],
+                "sensitivity": row[6],
             }
 
 
@@ -454,13 +580,14 @@ def clear_chunks(con: sqlite3.Connection) -> None:
 def insert_chunk(con: sqlite3.Connection, chunk_id: str, message_id: Optional[str],
                  thread_id: str, chunk_index: int, text: str,
                  ts_start: str, ts_end: str, embedding: list[float],
-                 meta: Optional[dict] = None):
+                 meta: Optional[dict] = None, *, sensitivity: str = "public"):
+    _validate_level(sensitivity)
     con.execute(
         "INSERT OR IGNORE INTO chunks "
-        "(chunk_id, message_id, canonical_thread_id, chunk_index, text, ts_start, ts_end, meta) "
-        "VALUES (?,?,?,?,?,?,?,?)",
+        "(chunk_id, message_id, canonical_thread_id, chunk_index, text, ts_start, ts_end, meta, "
+        "sensitivity) VALUES (?,?,?,?,?,?,?,?,?)",
         (chunk_id, message_id, thread_id, chunk_index, text, ts_start, ts_end,
-         json.dumps(meta) if meta else None),
+         json.dumps(meta) if meta else None, sensitivity),
     )
     con.execute(
         "INSERT OR IGNORE INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
@@ -469,10 +596,13 @@ def insert_chunk(con: sqlite3.Connection, chunk_id: str, message_id: Optional[st
 
 
 def insert_thought(con: sqlite3.Connection, thought_id: str, text: str,
-                   created_at: str, embedding: list[float], meta: Optional[dict] = None):
+                   created_at: str, embedding: list[float], meta: Optional[dict] = None,
+                   *, sensitivity: str = "public"):
+    _validate_level(sensitivity)
     con.execute(
-        "INSERT OR IGNORE INTO thoughts (thought_id, text, created_at, meta) VALUES (?,?,?,?)",
-        (thought_id, text, created_at, json.dumps(meta) if meta else None),
+        "INSERT OR IGNORE INTO thoughts (thought_id, text, created_at, meta, sensitivity) "
+        "VALUES (?,?,?,?,?)",
+        (thought_id, text, created_at, json.dumps(meta) if meta else None, sensitivity),
     )
     con.execute(
         "INSERT OR IGNORE INTO vec_thoughts (thought_id, embedding) VALUES (?, ?)",
@@ -488,6 +618,8 @@ def search_chunks(
     cutoff_iso: str | None = None,
     sort_by_time: bool = False,
     group_thread_ids: set[str] | None = None,
+    *,
+    scope: tuple = _DEFAULT_SCOPE,
 ):
     # An explicit empty set means "filter to zero threads" → nothing to return.
     # Without this, bool(set()) is False, needs_filter ignores it, and we'd
@@ -495,7 +627,9 @@ def search_chunks(
     if group_thread_ids is not None and not group_thread_ids:
         return []
 
-    needs_filter = bool(platform or cutoff_iso or group_thread_ids)
+    scope = _validate_scope(scope)
+    scope_active = set(scope) != set(SENSITIVITY_LEVELS)
+    needs_filter = bool(platform or cutoff_iso or group_thread_ids) or scope_active
     # When scoping to a small set of threads, the target chunks are unlikely to appear
     # in the global top (limit * 5) results across 90k+ chunks. Use a much larger
     # candidate pool so filtering actually finds matching chunks.
@@ -538,6 +672,11 @@ def search_chunks(
         conditions.append(f"c.canonical_thread_id IN ({placeholders})")
         params.extend(group_thread_ids)
 
+    if scope_active:
+        scope_sql, scope_params = _scope_sql(scope, "c.sensitivity")
+        conditions.append(scope_sql)
+        params.extend(scope_params)
+
     join_clause = " JOIN messages m ON c.message_id = m.message_id" if need_message_join else ""
     where_sql = " AND ".join(conditions)
 
@@ -555,12 +694,31 @@ def search_chunks(
     return [(c, d) for c, ts, d in matched[:limit]]
 
 
-def search_thoughts(con: sqlite3.Connection, embedding: list[float], limit: int = 10):
-    return con.execute(
+def search_thoughts(con: sqlite3.Connection, embedding: list[float], limit: int = 10, *,
+                    scope: tuple = _DEFAULT_SCOPE):
+    scope = _validate_scope(scope)
+    scope_active = set(scope) != set(SENSITIVITY_LEVELS)
+    # vec0 can't carry filter columns: over-fetch, filter against thoughts,
+    # keep KNN distance order, truncate.
+    fetch_limit = limit * 5 if scope_active else limit
+    raw = con.execute(
         "SELECT thought_id, distance FROM vec_thoughts "
         "WHERE embedding MATCH ? AND k = ?",
-        (serialize_f32(embedding), limit),
+        (serialize_f32(embedding), fetch_limit),
     ).fetchall()
+    if not scope_active or not raw:
+        return raw[:limit]
+    ids = [r[0] for r in raw]
+    scope_sql, scope_params = _scope_sql(scope)
+    placeholders = ",".join("?" * len(ids))
+    allowed = {
+        r[0] for r in con.execute(
+            f"SELECT thought_id FROM thoughts WHERE thought_id IN ({placeholders}) "
+            f"AND {scope_sql}",
+            (*ids, *scope_params),
+        ).fetchall()
+    }
+    return [(tid, dist) for tid, dist in raw if tid in allowed][:limit]
 
 
 def _build_fts_match(query: str) -> str:
@@ -589,6 +747,8 @@ def fts_search(
     cutoff_iso: str | None = None,
     sort_by_time: bool = False,
     group_thread_ids: set[str] | None = None,
+    *,
+    scope: tuple = _DEFAULT_SCOPE,
 ):
     """Full-text search via external-content FTS5, ranked by bm25 relevance.
 
@@ -596,16 +756,21 @@ def fts_search(
     which case the caller wants reverse-chronological. The messages row is
     joined directly on the shared rowid (no docid map).
     """
+    # Explicit empty thread set means "filter to zero threads" (same guard as
+    # search_chunks — without it an unknown group silently searches everything).
+    if group_thread_ids is not None and not group_thread_ids:
+        return []
+    scope_sql, scope_params = _scope_sql(scope, "m.sensitivity")
     match = _build_fts_match(query)
     if not match:
         return []
-    sql = """
+    sql = f"""
         SELECT m.message_id, m.text, m.canonical_thread_id, m.ts, m.role, m.title
         FROM messages_fts f
         JOIN messages m ON m.rowid = f.rowid
-        WHERE messages_fts MATCH ?
+        WHERE messages_fts MATCH ? AND {scope_sql}
     """
-    params: list = [match]
+    params: list = [match, *scope_params]
     if platform:
         platforms = [platform] if isinstance(platform, str) else platform
         placeholders = ",".join("?" * len(platforms))
@@ -630,12 +795,19 @@ def get_recent_chunks(
     cutoff_iso: str,
     limit: int = 20,
     platform: str | list[str] | None = None,
+    *,
+    scope: tuple = _DEFAULT_SCOPE,
 ):
+    # Filter on the chunk's own denormalized column in BOTH branches — the
+    # no-platform branch never joins messages, so a message-side filter would
+    # silently not apply there.
+    scope_sql, scope_params = _scope_sql(scope, "sensitivity")
     if not platform:
         return con.execute(
-            "SELECT chunk_id, text, canonical_thread_id, ts_start, meta "
-            "FROM chunks WHERE ts_start >= ? ORDER BY ts_start DESC LIMIT ?",
-            (cutoff_iso, limit),
+            f"SELECT chunk_id, text, canonical_thread_id, ts_start, meta "
+            f"FROM chunks WHERE ts_start >= ? AND {scope_sql} "
+            f"ORDER BY ts_start DESC LIMIT ?",
+            (cutoff_iso, *scope_params, limit),
         ).fetchall()
 
     platforms = [platform] if isinstance(platform, str) else platform
@@ -645,62 +817,79 @@ def get_recent_chunks(
         SELECT c.chunk_id, c.text, c.canonical_thread_id, c.ts_start, c.meta
         FROM chunks c
         JOIN messages m ON c.message_id = m.message_id
-        WHERE c.ts_start >= ? AND m.platform IN ({placeholders})
+        WHERE c.ts_start >= ? AND m.platform IN ({placeholders}) AND c.{scope_sql}
         ORDER BY c.ts_start DESC LIMIT ?
         """,
-        (cutoff_iso, *platforms, limit),
+        (cutoff_iso, *platforms, *scope_params, limit),
     ).fetchall()
 
 
-def get_recent_thoughts(con: sqlite3.Connection, cutoff_iso: str, limit: int = 20):
+def get_recent_thoughts(con: sqlite3.Connection, cutoff_iso: str, limit: int = 20, *,
+                        scope: tuple = _DEFAULT_SCOPE):
+    scope_sql, scope_params = _scope_sql(scope)
     return con.execute(
-        "SELECT thought_id, text, created_at, meta "
-        "FROM thoughts WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
-        (cutoff_iso, limit),
+        f"SELECT thought_id, text, created_at, meta "
+        f"FROM thoughts WHERE created_at >= ? AND {scope_sql} "
+        f"ORDER BY created_at DESC LIMIT ?",
+        (cutoff_iso, *scope_params, limit),
     ).fetchall()
 
 
-def get_chunk_by_id(con: sqlite3.Connection, chunk_id: str):
+def get_chunk_by_id(con: sqlite3.Connection, chunk_id: str, *,
+                    scope: tuple = _DEFAULT_SCOPE):
+    # Direct-ID lookups enforce scope too: they are reachable with no search
+    # step in front (e.g. provenance tools holding a chunk_id).
+    scope_sql, scope_params = _scope_sql(scope)
     return con.execute(
-        "SELECT text, canonical_thread_id, ts_start, ts_end, meta FROM chunks WHERE chunk_id = ?",
-        (chunk_id,),
+        f"SELECT text, canonical_thread_id, ts_start, ts_end, meta FROM chunks "
+        f"WHERE chunk_id = ? AND {scope_sql}",
+        (chunk_id, *scope_params),
     ).fetchone()
 
 
-def get_thought_by_id(con: sqlite3.Connection, thought_id: str):
+def get_thought_by_id(con: sqlite3.Connection, thought_id: str, *,
+                      scope: tuple = _DEFAULT_SCOPE):
+    scope_sql, scope_params = _scope_sql(scope)
     return con.execute(
-        "SELECT text, created_at, meta FROM thoughts WHERE thought_id = ?",
-        (thought_id,),
+        f"SELECT text, created_at, meta FROM thoughts WHERE thought_id = ? AND {scope_sql}",
+        (thought_id, *scope_params),
     ).fetchone()
 
 
 # ── Export helpers ────────────────────────────────────────────────────────────
 
 def export_messages(con: sqlite3.Connection, platform: Optional[str] = None,
-                    limit: Optional[int] = None):
-    query = """
-        SELECT message_id, canonical_thread_id, platform, account_id,
-               ts, role, text, title, source_id
-        FROM messages ORDER BY platform, canonical_thread_id, ts
-    """
-    params: list = []
+                    limit: Optional[int] = None, *, scope: tuple = _DEFAULT_SCOPE):
+    scope_sql, scope_params = _scope_sql(scope)
+    conditions = [scope_sql]
+    params: list = list(scope_params)
     if platform:
-        query = query.replace("ORDER BY", "WHERE platform = ? ORDER BY")
+        conditions.append("platform = ?")
         params.append(platform)
+    query = f"""
+        SELECT message_id, canonical_thread_id, platform, account_id,
+               ts, role, text, title, source_id, sensitivity
+        FROM messages WHERE {" AND ".join(conditions)}
+        ORDER BY platform, canonical_thread_id, ts
+    """
     if limit:
         query += " LIMIT ?"
         params.append(limit)
     rows = con.execute(query, params).fetchall()
     return [
         {"message_id": r[0], "thread_id": r[1], "platform": r[2], "account_id": r[3],
-         "timestamp": r[4], "role": r[5], "content": r[6], "title": r[7], "source_id": r[8]}
+         "timestamp": r[4], "role": r[5], "content": r[6], "title": r[7], "source_id": r[8],
+         "sensitivity": r[9]}
         for r in rows
     ]
 
 
-def export_thoughts(con: sqlite3.Connection):
+def export_thoughts(con: sqlite3.Connection, *, scope: tuple = _DEFAULT_SCOPE):
+    scope_sql, scope_params = _scope_sql(scope)
     rows = con.execute(
-        "SELECT thought_id, text, created_at, meta FROM thoughts ORDER BY created_at"
+        f"SELECT thought_id, text, created_at, meta FROM thoughts "
+        f"WHERE {scope_sql} ORDER BY created_at",
+        scope_params,
     ).fetchall()
     return [{"thought_id": r[0], "content": r[1], "created_at": r[2], "metadata": r[3]}
             for r in rows]
@@ -708,19 +897,34 @@ def export_thoughts(con: sqlite3.Connection):
 
 # ── Thread iteration + summaries ─────────────────────────────────────────────
 
-def iter_threads(con: sqlite3.Connection):
-    """Yield one dict per unique thread with metadata aggregated from messages."""
-    cur = con.execute("""
+# Numeric ranks for computing a thread's effective (max) sensitivity in SQL.
+_LEVEL_RANK_SQL = "CASE sensitivity WHEN 'sealed' THEN 2 WHEN 'private' THEN 1 ELSE 0 END"
+
+
+def iter_threads(con: sqlite3.Connection, *, scope: tuple = _DEFAULT_SCOPE):
+    """Yield one dict per unique thread with metadata aggregated from messages.
+
+    A thread is excluded if ANY of its messages is outside scope — titles and
+    aggregates leak topics, so mixed threads fail closed.
+    """
+    scope = _validate_scope(scope)
+    max_allowed_rank = max(
+        {"public": 0, "private": 1, "sealed": 2}[s] for s in scope
+    )
+    cur = con.execute(f"""
         SELECT canonical_thread_id,
                MAX(platform) AS platform,
                MAX(title) AS title,
                COUNT(*) AS message_count,
                MIN(ts) AS ts_start,
-               MAX(ts) AS ts_end
+               MAX(ts) AS ts_end,
+               MAX({_LEVEL_RANK_SQL}) AS max_rank
         FROM messages
         GROUP BY canonical_thread_id
+        HAVING max_rank <= ?
         ORDER BY ts_start ASC
-    """)
+    """, (max_allowed_rank,))
+    rank_to_level = {0: "public", 1: "private", 2: "sealed"}
     for row in cur:
         yield {
             "canonical_thread_id": row[0],
@@ -729,14 +933,18 @@ def iter_threads(con: sqlite3.Connection):
             "message_count": row[3],
             "ts_start": row[4],
             "ts_end": row[5],
+            "sensitivity": rank_to_level[row[6]],
         }
 
 
-def get_thread_messages(con: sqlite3.Connection, canonical_thread_id: str) -> list[dict]:
-    """Return all messages for a thread, ordered chronologically."""
+def get_thread_messages(con: sqlite3.Connection, canonical_thread_id: str, *,
+                        scope: tuple = _DEFAULT_SCOPE) -> list[dict]:
+    """Return all in-scope messages for a thread, ordered chronologically."""
+    scope_sql, scope_params = _scope_sql(scope)
     rows = con.execute(
-        "SELECT role, text, ts FROM messages WHERE canonical_thread_id = ? ORDER BY ts",
-        (canonical_thread_id,),
+        f"SELECT role, text, ts FROM messages "
+        f"WHERE canonical_thread_id = ? AND {scope_sql} ORDER BY ts",
+        (canonical_thread_id, *scope_params),
     ).fetchall()
     return [{"role": r[0], "text": r[1], "ts": r[2]} for r in rows]
 
@@ -774,22 +982,25 @@ def insert_thread_summary(
     key_topics: list[str],
     summary_model: str,
     now: str,
+    *,
+    sensitivity: str = "public",
 ):
     """Insert or replace a single summary segment."""
+    _validate_level(sensitivity)
     con.execute(
         """
         INSERT OR REPLACE INTO thread_summaries
             (summary_id, canonical_thread_id, segment_index, title, platform,
              message_count, segment_chars, ts_start, ts_end, summary,
-             key_topics, summary_model, created_at, updated_at)
+             key_topics, summary_model, created_at, updated_at, sensitivity)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,
             COALESCE((SELECT created_at FROM thread_summaries WHERE summary_id=?), ?),
-            ?)
+            ?, ?)
         """,
         (summary_id, canonical_thread_id, segment_index, title, platform,
          message_count, segment_chars, ts_start, ts_end, summary,
          json.dumps(key_topics), summary_model,
-         summary_id, now, now),
+         summary_id, now, now, sensitivity),
     )
 
 
@@ -821,71 +1032,103 @@ def delete_thread_summaries(con: sqlite3.Connection, canonical_thread_id: str) -
     return cur.rowcount
 
 
-def get_thread_summary(con: sqlite3.Connection, canonical_thread_id: str):
+def get_thread_summary(con: sqlite3.Connection, canonical_thread_id: str, *,
+                       scope: tuple = _DEFAULT_SCOPE):
     """Returns the first segment (segment_index=0) for a thread using the 10-col layout, or None."""
+    scope_sql, scope_params = _scope_sql(scope)
     return con.execute(
-        _SUMMARY_SELECT + " WHERE canonical_thread_id = ? ORDER BY segment_index LIMIT 1",
-        (canonical_thread_id,),
+        _SUMMARY_SELECT
+        + f" WHERE canonical_thread_id = ? AND {scope_sql} ORDER BY segment_index LIMIT 1",
+        (canonical_thread_id, *scope_params),
     ).fetchone()
 
 
-def get_thread_summaries(con: sqlite3.Connection, canonical_thread_id: str) -> list:
-    """Return all segments for a thread in segment_index order (10-col layout).
+def get_thread_summaries(con: sqlite3.Connection, canonical_thread_id: str, *,
+                         scope: tuple = _DEFAULT_SCOPE) -> list:
+    """Return all in-scope segments for a thread in segment_index order (10-col layout).
 
     Returns an empty list if the thread has no summary yet.
     Use this when you need the full picture of a thread (e.g. for display),
     rather than get_thread_summary which returns only the first segment.
     """
+    scope_sql, scope_params = _scope_sql(scope)
     return con.execute(
-        _SUMMARY_SELECT + " WHERE canonical_thread_id = ? ORDER BY segment_index",
-        (canonical_thread_id,),
+        _SUMMARY_SELECT
+        + f" WHERE canonical_thread_id = ? AND {scope_sql} ORDER BY segment_index",
+        (canonical_thread_id, *scope_params),
     ).fetchall()
 
 
-def get_summary_by_id(con: sqlite3.Connection, summary_id: str):
+def get_summary_by_id(con: sqlite3.Connection, summary_id: str, *,
+                      scope: tuple = _DEFAULT_SCOPE):
     """Fetch a single segment by summary_id using the 10-col layout."""
+    scope_sql, scope_params = _scope_sql(scope)
     return con.execute(
-        _SUMMARY_SELECT + " WHERE summary_id = ?",
-        (summary_id,),
+        _SUMMARY_SELECT + f" WHERE summary_id = ? AND {scope_sql}",
+        (summary_id, *scope_params),
     ).fetchone()
 
 
 def list_thread_summaries(
     con: sqlite3.Connection,
     limit: int = 100,
-    platform: Optional[str] = None,
+    platform: str | list[str] | None = None,
     since_iso: Optional[str] = None,
+    *,
+    scope: tuple = _DEFAULT_SCOPE,
 ):
     """Returns rows in the 10-col layout, one row per segment, ordered newest first.
 
     10-col layout: summary_id[0], canonical_thread_id[1], segment_index[2], title[3],
     platform[4], message_count[5], ts_start[6], ts_end[7], summary[8], key_topics[9].
     """
+    scope_sql, scope_params = _scope_sql(scope)
     sql = _SUMMARY_SELECT
     params: list = []
-    conditions = []
+    conditions = [scope_sql]
+    params.extend(scope_params)
     if platform:
-        conditions.append("platform = ?")
-        params.append(platform)
+        # Accept a list like the other search functions (callers pass parsed
+        # platform lists; a single string still works).
+        platforms = [platform] if isinstance(platform, str) else list(platform)
+        placeholders = ",".join("?" * len(platforms))
+        conditions.append(f"platform IN ({placeholders})")
+        params.extend(platforms)
     if since_iso:
         conditions.append("ts_start >= ?")
         params.append(since_iso)
-    if conditions:
-        sql += " WHERE " + " AND ".join(conditions)
+    sql += " WHERE " + " AND ".join(conditions)
     sql += " ORDER BY ts_start DESC, segment_index ASC LIMIT ?"
     params.append(limit)
     return con.execute(sql, params).fetchall()
 
 
 def search_thread_summaries(
-    con: sqlite3.Connection, embedding: list[float], limit: int = 10
+    con: sqlite3.Connection, embedding: list[float], limit: int = 10, *,
+    scope: tuple = _DEFAULT_SCOPE,
 ):
     """Vector KNN search on thread summaries. Returns [(summary_id, distance)]."""
-    return con.execute(
+    scope = _validate_scope(scope)
+    scope_active = set(scope) != set(SENSITIVITY_LEVELS)
+    fetch_limit = limit * 5 if scope_active else limit
+    raw = con.execute(
         "SELECT summary_id, distance FROM vec_thread_summaries "
         "WHERE embedding MATCH ? AND k = ?",
-        (serialize_f32(embedding), limit),
+        (serialize_f32(embedding), fetch_limit),
     ).fetchall()
+    if not scope_active or not raw:
+        return raw[:limit]
+    ids = [r[0] for r in raw]
+    scope_sql, scope_params = _scope_sql(scope)
+    placeholders = ",".join("?" * len(ids))
+    allowed = {
+        r[0] for r in con.execute(
+            f"SELECT summary_id FROM thread_summaries "
+            f"WHERE summary_id IN ({placeholders}) AND {scope_sql}",
+            (*ids, *scope_params),
+        ).fetchall()
+    }
+    return [(sid, dist) for sid, dist in raw if sid in allowed][:limit]
 
 
 def summary_count(con: sqlite3.Connection) -> int:
@@ -987,8 +1230,17 @@ def delete_group(con: sqlite3.Connection, group_id: str) -> bool:
     return cur.rowcount > 0
 
 
-def get_threads_in_group(con: sqlite3.Connection, group_id: str) -> list[dict]:
-    """Return thread metadata for all members of a group."""
+def get_threads_in_group(con: sqlite3.Connection, group_id: str, *,
+                         scope: tuple = _DEFAULT_SCOPE) -> list[dict]:
+    """Return thread metadata for in-scope members of a group.
+
+    Mixed threads fail closed: any out-of-scope message hides the whole thread
+    (titles and aggregates leak topics).
+    """
+    scope = _validate_scope(scope)
+    max_allowed_rank = max(
+        {"public": 0, "private": 1, "sealed": 2}[s] for s in scope
+    )
     rows = con.execute("""
         SELECT m.canonical_thread_id,
                MAX(msgs.platform) AS platform,
@@ -1000,8 +1252,9 @@ def get_threads_in_group(con: sqlite3.Connection, group_id: str) -> list[dict]:
         JOIN messages msgs ON msgs.canonical_thread_id = m.canonical_thread_id
         WHERE m.group_id = ?
         GROUP BY m.canonical_thread_id
+        HAVING MAX(CASE msgs.sensitivity WHEN 'sealed' THEN 2 WHEN 'private' THEN 1 ELSE 0 END) <= ?
         ORDER BY ts_start DESC
-    """, (group_id,)).fetchall()
+    """, (group_id, max_allowed_rank)).fetchall()
     return [
         {"canonical_thread_id": r[0], "platform": r[1], "title": r[2],
          "message_count": r[3], "ts_start": r[4], "ts_end": r[5]}
@@ -1023,3 +1276,117 @@ def group_count(con: sqlite3.Connection) -> int:
         return con.execute("SELECT count(*) FROM thread_groups").fetchone()[0]
     except sqlite3.OperationalError:
         return 0
+
+
+# ── Sensitivity classification ────────────────────────────────────────────────
+
+_LEVEL_RANK = {"public": 0, "private": 1, "sealed": 2}
+
+
+def set_thread_sensitivity(con: sqlite3.Connection, thread_ids: list[str],
+                           level: str) -> dict:
+    """Set the sensitivity level for whole threads across all content tables.
+
+    Returns per-table update counts. Commits.
+    """
+    _validate_level(level)
+    counts = {"messages": 0, "chunks": 0, "thread_summaries": 0}
+    batch = 500  # keep IN() placeholder lists well under SQLite's variable cap
+    for start in range(0, len(thread_ids), batch):
+        ids = list(thread_ids[start:start + batch])
+        placeholders = ",".join("?" * len(ids))
+        for table in ("messages", "chunks", "thread_summaries"):
+            cur = con.execute(
+                f"UPDATE {table} SET sensitivity = ? "
+                f"WHERE canonical_thread_id IN ({placeholders})",
+                (level, *ids),
+            )
+            counts[table] += cur.rowcount
+    con.commit()
+    return counts
+
+
+def get_thread_sensitivity(con: sqlite3.Connection, canonical_thread_id: str):
+    """Return (effective_level, message_count) for a thread, or None if unknown.
+
+    The effective level is the max over the thread's messages.
+    """
+    row = con.execute(f"""
+        SELECT MAX({_LEVEL_RANK_SQL}), COUNT(*)
+        FROM messages WHERE canonical_thread_id = ?
+    """, (canonical_thread_id,)).fetchone()
+    if not row or not row[1]:
+        return None
+    rank_to_level = {v: k for k, v in _LEVEL_RANK.items()}
+    return (rank_to_level[row[0]], row[1])
+
+
+def sensitivity_counts(con: sqlite3.Connection) -> dict:
+    """Per-level row counts for messages, threads, thoughts, and summaries."""
+    out: dict = {"messages": {}, "threads": {}, "thoughts": {}, "thread_summaries": {}}
+    for table in ("messages", "thoughts", "thread_summaries"):
+        for level, n in con.execute(
+            f"SELECT sensitivity, COUNT(*) FROM {table} GROUP BY sensitivity"
+        ).fetchall():
+            out[table][level] = n
+    rank_to_level = {v: k for k, v in _LEVEL_RANK.items()}
+    for rank, n in con.execute(f"""
+        SELECT max_rank, COUNT(*) FROM (
+            SELECT MAX({_LEVEL_RANK_SQL}) AS max_rank
+            FROM messages GROUP BY canonical_thread_id
+        ) GROUP BY max_rank
+    """).fetchall():
+        out["threads"][rank_to_level[rank]] = n
+    return out
+
+
+def sealed_exists(con: sqlite3.Connection) -> bool:
+    """True if any row in any content table is sealed (hits the partial indexes)."""
+    for table in _SENSITIVITY_TABLES:
+        try:
+            if con.execute(
+                f"SELECT 1 FROM {table} WHERE sensitivity = 'sealed' LIMIT 1"
+            ).fetchone():
+                return True
+        except sqlite3.OperationalError:
+            return False  # pre-v3 archive: no column → nothing sealed
+    return False
+
+
+def threads_before(con: sqlite3.Connection, cutoff_iso: str) -> list[str]:
+    """Thread ids whose last message predates cutoff_iso (thread-scoped --before)."""
+    return [
+        r[0] for r in con.execute(
+            "SELECT canonical_thread_id FROM messages "
+            "GROUP BY canonical_thread_id HAVING MAX(ts) < ? ORDER BY MAX(ts)",
+            (cutoff_iso,),
+        ).fetchall()
+    ]
+
+
+def reconcile_thread_sensitivity(con: sqlite3.Connection) -> int:
+    """Re-apply thread-level classification to rows added after the fact.
+
+    For every thread containing at least one non-public message, raise all of
+    the thread's messages/chunks/summaries to the thread's max level. Never
+    lowers a level and never touches all-public threads, so it re-applies
+    explicit prior classification without silently reclassifying anything.
+    Returns the number of rows raised. Commits.
+    """
+    raised = 0
+    rank_to_level = {v: k for k, v in _LEVEL_RANK.items()}
+    classified = con.execute(f"""
+        SELECT canonical_thread_id, MAX({_LEVEL_RANK_SQL}) AS max_rank
+        FROM messages GROUP BY canonical_thread_id HAVING max_rank > 0
+    """).fetchall()
+    for thread_id, rank in classified:
+        level = rank_to_level[rank]
+        for table in ("messages", "chunks", "thread_summaries"):
+            cur = con.execute(f"""
+                UPDATE {table} SET sensitivity = ?
+                WHERE canonical_thread_id = ?
+                  AND {_LEVEL_RANK_SQL} < ?
+            """, (level, thread_id, rank))
+            raised += cur.rowcount
+    con.commit()
+    return raised

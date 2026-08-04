@@ -174,6 +174,16 @@ def run(
         con.close()
         return 0, 0
 
+    # New rows land as 'public' by default; if their thread was already
+    # classified private/sealed, raise them to the thread's level before
+    # anything can read them (re-syncing a classified thread must not
+    # reintroduce public rows).
+    if inserted:
+        raised = db.reconcile_thread_sensitivity(con)
+        if raised:
+            print(f"  Sensitivity: {raised} new row(s) inherited their "
+                  f"thread's classification", file=sys.stderr)
+
     total = db.message_count(con)
     con.close()
 

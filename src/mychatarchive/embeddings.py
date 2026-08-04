@@ -75,7 +75,9 @@ def run(db_path: Path, batch_size: int = 64, force: bool = False):
     skipped = 0
 
     pbar = tqdm(total=total, desc="Embedding", file=sys.stderr)
-    for msg in db.iter_messages(con):
+    # Embedding is local-only, so all sensitivity levels are processed —
+    # private/sealed content stays semantically searchable for opted-in callers.
+    for msg in db.iter_messages(con, scope=db.SENSITIVITY_LEVELS):
         pbar.update(1)
 
         if msg["message_id"] in already_embedded:
@@ -128,6 +130,7 @@ def _flush_batch(con, batch: list[tuple[str, dict, int]]) -> int:
             ts_end=meta["ts"],
             embedding=emb,
             meta={"role": meta["role"], "title": meta["title"]},
+            sensitivity=meta.get("sensitivity", "public"),
         )
 
     con.commit()

@@ -29,7 +29,15 @@ classifiers = [
 # [local] extra; hosted embeddings use the [openai] extra.
 dependencies = [
     "sqlite-vec>=0.1.1",
-    "mcp[cli]>=1.0.0",
+    # Floor is 1.10.0, not a round number: FastMCP (mcp.server.fastmcp) only
+    # exists from 1.2.0 onward, and src/mychatarchive/mcp/server.py also sets
+    # mcp.settings.transport_security.enable_dns_rebinding_protection, which
+    # requires the TransportSecuritySettings support added in 1.10.0 (that's
+    # the binding constraint -- an installed 1.2.x-1.9.x satisfies FastMCP
+    # but AttributeErrors on transport_security). A resolver that keeps an
+    # already-installed pre-1.10 mcp otherwise satisfies a looser floor and
+    # dies at runtime instead of at install time.
+    "mcp[cli]>=1.10.0",
     "tqdm>=4.66.0",
     "ijson>=3.2.0",
     "rich>=13.0.0",

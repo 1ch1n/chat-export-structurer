@@ -38,10 +38,11 @@ def ensure_schema(con) -> None:
 
 def insert_message(con, message_id: str, canonical_thread_id: str,
                    platform: str, account_id: str, ts: str, role: str,
-                   text: str, title: str, source_id: str) -> bool:
+                   text: str, title: str, source_id: str,
+                   *, sensitivity: str = "public") -> bool:
     return _b().insert_message(
         con, message_id, canonical_thread_id, platform, account_id,
-        ts, role, text, title, source_id,
+        ts, role, text, title, source_id, sensitivity=sensitivity,
     )
 
 

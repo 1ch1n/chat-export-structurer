@@ -33,6 +33,7 @@ class StorageBackend(Protocol):
         self, con, message_id: str, canonical_thread_id: str,
         platform: str, account_id: str, ts: str, role: str,
         text: str, title: str, source_id: str,
+        *, sensitivity: str = "public",
     ) -> bool: ...
 
     # Counts

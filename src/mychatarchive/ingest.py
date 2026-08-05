@@ -73,6 +73,13 @@ def _flush_thread(
         norm_text(first_snip),
     ]))
 
+    # A re-import of an already-classified thread must never introduce rows at
+    # a wider scope than the thread itself — not even transiently, since a
+    # concurrent MCP server reads committed rows, and an interrupted import
+    # would otherwise leave them public permanently.
+    existing = db.get_thread_sensitivity(con, canonical_thread_id)
+    thread_level = existing[0] if existing else "public"
+
     inserted = 0
     duplicates = 0
     for msg in thread_messages:
@@ -89,7 +96,7 @@ def _flush_thread(
         was_inserted = db.insert_message(
             con, message_id, canonical_thread_id, platform, account_id,
             ts_iso, msg["role"] or "", msg["content"] or "",
-            msg["thread_title"], source_id,
+            msg["thread_title"], source_id, sensitivity=thread_level,
         )
 
         if was_inserted:

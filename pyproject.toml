@@ -37,7 +37,17 @@ dependencies = [
     # but AttributeErrors on transport_security). A resolver that keeps an
     # already-installed pre-1.10 mcp otherwise satisfies a looser floor and
     # dies at runtime instead of at install time.
-    "mcp[cli]>=1.10.0",
+    #
+    # Capped below 2.0.0: mcp 2.0.0 is a separate, deliberately breaking
+    # major version (the v1.x line continued in parallel through 1.29.0,
+    # released the same day as 2.0.0) that removed mcp.server.fastmcp
+    # entirely -- FastMCP now lives at mcp.server.mcpserver, and its
+    # transport params (host/port/transport_security/...) moved from the
+    # settings object onto run()/sse_app()/streamable_http_app() call
+    # arguments. server.py uses the pre-2.0 shape (mcp.server.fastmcp
+    # import, mcp.settings.port = port, mcp.sse_app() with no args), so
+    # >=2.0.0 breaks at import time, not just at the TLS code path.
+    "mcp[cli]>=1.10.0,<2.0.0",
     "tqdm>=4.66.0",
     "ijson>=3.2.0",
     "rich>=13.0.0",

@@ -19,6 +19,57 @@ PARSERS = {
 
 DIRECTORY_PARSERS = {"claude_code", "cursor"}
 
+# Claude Code session .jsonl files interleave message records with
+# bookkeeping records; all of these `type` values are shapes the parser
+# already knows to either read or skip (see parsers/claude_code.py).
+_CLAUDE_CODE_JSONL_TYPES = {
+    "user", "assistant", "file-history-snapshot",
+    "queue-operation", "mode", "ai-title", "summary",
+}
+
+# A recognized `type` alone is too generic — other tools could plausibly emit
+# JSONL with {"type": "user", ...} lines. Require at least one of these
+# claude_code-specific fields too, so detection stays specific to real
+# session files rather than stealing any JSONL with a matching `type`.
+_CLAUDE_CODE_JSONL_MARKER_KEYS = {
+    "sessionId", "uuid", "parentUuid", "leafUuid", "cwd", "gitBranch", "version",
+}
+
+
+def _looks_like_claude_code_jsonl(p: Path, max_lines: int = 10) -> bool:
+    """Scan the first few non-empty lines of a .jsonl file for a
+    claude_code-shaped record.
+
+    Real Claude Code session files commonly lead with one or more bookkeeping
+    records (queue-operation, mode, ai-title, summary) before the first
+    user/assistant turn, so checking only the first line (the old behavior)
+    misses them and detection falls through to "unknown format".
+    """
+    checked = 0
+    try:
+        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                checked += 1
+                if checked > max_lines:
+                    break
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if (
+                    record.get("type") in _CLAUDE_CODE_JSONL_TYPES
+                    and _CLAUDE_CODE_JSONL_MARKER_KEYS & record.keys()
+                ):
+                    return True
+    except OSError:
+        return False
+    return False
+
 
 def detect_format(file_path: Path) -> str | None:
     """Auto-detect export format by inspecting the JSON structure.
@@ -37,15 +88,8 @@ def detect_format(file_path: Path) -> str | None:
         return None
 
     if p.suffix == ".jsonl":
-        with open(p, "r", encoding="utf-8", errors="ignore") as f:
-            first_line = f.readline().strip()
-        if first_line:
-            try:
-                record = json.loads(first_line)
-                if isinstance(record, dict) and record.get("type") in ("user", "assistant", "file-history-snapshot"):
-                    return "claude_code"
-            except json.JSONDecodeError:
-                pass
+        if _looks_like_claude_code_jsonl(p):
+            return "claude_code"
 
     if p.name == "state.vscdb":
         return "cursor"

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import sys
 import urllib.error
@@ -82,6 +83,13 @@ def _segment_messages(messages: list[dict], per_segment: int) -> list[list[dict]
     if not messages:
         return []
     return [messages[i:i + per_segment] for i in range(0, len(messages), per_segment)]
+
+
+def _expected_segment_count(message_count: int, per_segment: int) -> int:
+    """How many segments a thread with message_count messages should have."""
+    if message_count <= 0 or per_segment <= 0:
+        return 0
+    return math.ceil(message_count / per_segment)
 
 
 def _segment_ts(messages: list[dict]) -> tuple[str | None, str | None]:
@@ -225,10 +233,19 @@ def run(
     print(f"  [summarize] {total:,} threads in scope {list(scope)}", file=sys.stderr)
 
     if not force:
-        threads = [t for t in threads if not db.has_thread_summary(con, t["canonical_thread_id"])]
-        print(f"  [summarize] {len(threads):,} without summaries", file=sys.stderr)
+        # A thread is "complete" only when it has as many stored segments as
+        # its current message count implies (see run() docstring / Bug 2 note
+        # below); anything else — never summarized, or interrupted partway
+        # through a previous run — is picked back up here.
+        def _incomplete(t: dict) -> bool:
+            expected = _expected_segment_count(t["message_count"], messages_per_segment)
+            have = len(db.get_thread_summary_segment_counts(con, t["canonical_thread_id"]))
+            return have != expected
+
+        threads = [t for t in threads if _incomplete(t)]
+        print(f"  [summarize] {len(threads):,} incomplete or unsummarized", file=sys.stderr)
     else:
-        print(f"  [summarize] --force: re-summarizing all", file=sys.stderr)
+        print("  [summarize] --force: re-summarizing all", file=sys.stderr)
 
     if limit:
         threads = threads[:limit]
@@ -264,13 +281,29 @@ def run(
             if not messages:
                 continue
 
-            if force:
-                db.delete_thread_summaries(con, thread_id)
-
             segments = _segment_messages(messages, messages_per_segment)
             n_segments = len(segments)
 
+            # Bug 2 (resumability): a segment already on disk with the same
+            # message_count is reused as-is rather than re-paid-for. force=True
+            # ignores prior segments entirely and regenerates every one. This
+            # correctly re-covers a thread that grew (its tail segment's
+            # message_count no longer matches) but is not foolproof against a
+            # messages_per_segment change that happens to leave the segment
+            # *count* unchanged — that edge case needs --force to fully repair.
+            existing_counts = {} if force else db.get_thread_summary_segment_counts(con, thread_id)
+
+            # Bug 1 (atomicity): generate every needed segment into memory
+            # first and touch the DB only once the whole thread has succeeded.
+            # If the API fails partway through, nothing for this thread is
+            # written or deleted here — under --force the pre-existing
+            # summaries are untouched; without --force the segments already
+            # on disk from an earlier run are untouched and still count next run.
+            new_segments = []
             for seg_idx, seg_messages in enumerate(segments):
+                if existing_counts.get(seg_idx) == len(seg_messages):
+                    continue  # unchanged since last run — don't re-pay for it
+
                 summary_id = f"{thread_id}::{seg_idx:04d}"
                 seg_ts_start, seg_ts_end = _segment_ts(seg_messages)
                 seg_chars = _segment_chars(seg_messages)
@@ -282,33 +315,64 @@ def run(
                 if not summary:
                     raise ValueError("Empty summary returned")
 
-                db.insert_thread_summary(
-                    con,
-                    summary_id=summary_id,
-                    canonical_thread_id=thread_id,
-                    segment_index=seg_idx,
-                    title=thread_meta.get("title"),
-                    platform=thread_meta.get("platform"),
-                    message_count=len(seg_messages),
-                    segment_chars=seg_chars,
-                    ts_start=seg_ts_start,
-                    ts_end=seg_ts_end,
-                    summary=summary,
-                    key_topics=key_topics,
-                    summary_model=model,
-                    now=now_str,
-                    sensitivity=thread_meta.get("sensitivity", "public"),
-                )
+                new_segments.append({
+                    "summary_id": summary_id,
+                    "segment_index": seg_idx,
+                    "message_count": len(seg_messages),
+                    "segment_chars": seg_chars,
+                    "ts_start": seg_ts_start,
+                    "ts_end": seg_ts_end,
+                    "summary": summary,
+                    "key_topics": key_topics,
+                })
 
-                if embedder:
-                    try:
-                        emb = embedder(summary)
-                        db.insert_thread_summary_embedding(con, summary_id, emb)
-                    except Exception as e:
-                        print(f"  [summarize] Embedding failed for {summary_id}: {e}",
-                              file=sys.stderr)
+            if not new_segments and not force:
+                # Nothing needed regenerating (e.g. only stale extra segments
+                # from a shrunk thread remain — not cleaned up here).
+                continue
 
-                total_segments += 1
+            # Every segment this thread needed has now succeeded — commit the
+            # replacement as one savepoint so a write-time failure (e.g. a
+            # disk error) can't leave old summaries deleted with nothing new
+            # in their place.
+            con.execute("SAVEPOINT thread_summary_write")
+            try:
+                if force:
+                    db.delete_thread_summaries(con, thread_id)
+
+                for seg in new_segments:
+                    db.insert_thread_summary(
+                        con,
+                        summary_id=seg["summary_id"],
+                        canonical_thread_id=thread_id,
+                        segment_index=seg["segment_index"],
+                        title=thread_meta.get("title"),
+                        platform=thread_meta.get("platform"),
+                        message_count=seg["message_count"],
+                        segment_chars=seg["segment_chars"],
+                        ts_start=seg["ts_start"],
+                        ts_end=seg["ts_end"],
+                        summary=seg["summary"],
+                        key_topics=seg["key_topics"],
+                        summary_model=model,
+                        now=now_str,
+                        sensitivity=thread_meta.get("sensitivity", "public"),
+                    )
+
+                    if embedder:
+                        try:
+                            emb = embedder(seg["summary"])
+                            db.insert_thread_summary_embedding(con, seg["summary_id"], emb)
+                        except Exception as e:
+                            print(f"  [summarize] Embedding failed for {seg['summary_id']}: {e}",
+                                  file=sys.stderr)
+
+                    total_segments += 1
+            except Exception:
+                con.execute("ROLLBACK TO thread_summary_write")
+                raise
+            finally:
+                con.execute("RELEASE thread_summary_write")
 
             processed += 1
 

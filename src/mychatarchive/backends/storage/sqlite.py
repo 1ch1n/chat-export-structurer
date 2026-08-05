@@ -979,6 +979,24 @@ def has_thread_summary(con: sqlite3.Connection, canonical_thread_id: str) -> boo
     return row is not None
 
 
+def get_thread_summary_segment_counts(
+    con: sqlite3.Connection, canonical_thread_id: str
+) -> dict[int, int]:
+    """Return {segment_index: message_count} for every stored segment of a thread.
+
+    Used to detect partially-summarized threads and to decide, segment by
+    segment, whether a previously-written summary still matches the current
+    segmentation (same message_count) or must be regenerated because the
+    thread grew or messages_per_segment changed.
+    """
+    rows = con.execute(
+        "SELECT segment_index, message_count FROM thread_summaries "
+        "WHERE canonical_thread_id = ?",
+        (canonical_thread_id,),
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
 def insert_thread_summary(
     con: sqlite3.Connection,
     summary_id: str,

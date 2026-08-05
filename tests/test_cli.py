@@ -100,6 +100,38 @@ def test_classify_dry_run_wins_over_confirm(tmp_path, monkeypatch, capsys):
     assert sealed == 0
 
 
+def test_classify_thread_dry_run_does_not_apply(tmp_path, monkeypatch, capsys):
+    # Regression: the single-thread branch ignored --dry-run and applied the
+    # change immediately, so a preview silently mutated the archive.
+    db_file = _seeded_db(tmp_path)
+
+    _run(["classify", "--thread", "t-px", "--level", "sealed", "--dry-run",
+          "--db", str(db_file)], monkeypatch)
+    out = capsys.readouterr().out
+    assert "Dry run" in out
+    assert "public -> sealed" in out  # preview still shows the intended change
+
+    con = sqlite3.connect(db_file)
+    levels = {r[0] for r in con.execute("SELECT sensitivity FROM messages")}
+    con.close()
+    assert levels == {"public"}, "dry run must not modify the archive"
+
+
+def test_classify_thread_applies_without_dry_run(tmp_path, monkeypatch, capsys):
+    db_file = _seeded_db(tmp_path)
+
+    _run(["classify", "--thread", "t-px", "--level", "sealed",
+          "--db", str(db_file)], monkeypatch)
+    assert "public -> sealed" in capsys.readouterr().out
+
+    con = sqlite3.connect(db_file)
+    rows = dict(con.execute(
+        "SELECT canonical_thread_id, sensitivity FROM messages"
+    ).fetchall())
+    con.close()
+    assert rows == {"t-px": "sealed", "t-code": "public"}
+
+
 def test_classify_before_is_thread_scoped_on_last_message(tmp_path, monkeypatch, capsys):
     db_file = _seeded_db(tmp_path)
 

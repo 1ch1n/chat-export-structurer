@@ -17,6 +17,11 @@ category keywords, personal workflow details, or machine paths in code,
 comments, tests, docs, or PR text. All examples synthetic (project-x style).
 Audit PR text against this before opening.
 
+## Agent delegation
+
+Workflows/subagents default to sonnet-class models; reserve the top model for
+planning, ranking, and final review.
+
 ## Conventions
 
 - Conventional-commit prefixes (`feat(storage):`, `fix:`, `docs:`); release

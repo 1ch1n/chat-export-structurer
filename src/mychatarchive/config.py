@@ -89,8 +89,26 @@ def get_embedding_model() -> str:
 
 
 def get_embedding_dim() -> int:
+    """Effective embedding dimension — what vec_chunks (and friends) get sized to.
+
+    An explicit "dimension" in config always wins. Otherwise the sane default
+    depends on the embedder backend: 384 is the LOCAL sentence-transformers
+    model's dim, not a universal default. The OpenAI backend's models return
+    much larger vectors natively (1536 / 3072); defaulting an OpenAI-backend
+    archive to 384 built a table too small for what the API actually
+    returns, breaking the very first insert. text-embedding-ada-002 in
+    particular always returns 1536 and can't be Matryoshka-shortened via the
+    "dimensions" request param (see backends/embeddings/openai.py), so this
+    matters even after that param is wired up.
+    """
     cfg = load_config()
-    return cfg.get("embeddings", {}).get("dimension", _DEFAULT_EMBEDDING_DIM)
+    emb = cfg.get("embeddings", {})
+    if "dimension" in emb:
+        return int(emb["dimension"])
+    if emb.get("backend") == "openai":
+        from mychatarchive.backends.embeddings.openai import _DEFAULT_MODEL, _MODEL_DIMS
+        return _MODEL_DIMS.get(emb.get("model", _DEFAULT_MODEL), 1536)
+    return _DEFAULT_EMBEDDING_DIM
 
 
 def get_chunk_max_chars() -> int:

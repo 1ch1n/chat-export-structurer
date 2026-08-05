@@ -28,6 +28,11 @@ _MODEL_DIMS: dict[str, int] = {
 _DEFAULT_MODEL = "text-embedding-3-small"
 _BATCH_SIZE = 2048  # OpenAI's max inputs per request
 
+# Only the newer -3 models accept the "dimensions" request param (Matryoshka
+# shortening); text-embedding-ada-002 always returns its fixed 1536 dims and
+# errors if "dimensions" is sent at all.
+_SUPPORTS_DIMENSIONS_PARAM = {"text-embedding-3-small", "text-embedding-3-large"}
+
 _client = None
 
 
@@ -71,9 +76,18 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     model = _get_model()
     results: list[list[float]] = []
 
+    # Request vectors sized to match what vec_chunks was actually built with
+    # (see dimension() below). Without this, the API always returns the
+    # model's native size regardless of the configured/table dimension, and
+    # the first insert into vec_chunks fails with a sqlite-vec dimension
+    # error after the batch has already been paid for.
+    kwargs = {}
+    if model in _SUPPORTS_DIMENSIONS_PARAM:
+        kwargs["dimensions"] = dimension()
+
     for i in range(0, len(texts), _BATCH_SIZE):
         batch = texts[i : i + _BATCH_SIZE]
-        response = client.embeddings.create(input=batch, model=model)
+        response = client.embeddings.create(input=batch, model=model, **kwargs)
         # API guarantees order matches input, but sort by index to be safe
         ordered = sorted(response.data, key=lambda item: item.index)
         results.extend(item.embedding for item in ordered)

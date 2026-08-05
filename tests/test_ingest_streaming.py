@@ -133,6 +133,37 @@ def test_anthropic_parser_streams():
         p.unlink(missing_ok=True)
 
 
+def test_unparseable_timestamp_is_counted_not_silently_dropped(tmp_db, capsys):
+    """A message whose source timestamp can't be parsed (parsers yield 0.0
+    for these — see anthropic.py / cursor.py) must not vanish from the
+    import summary. It should be counted as skipped, and inserted +
+    duplicates + skipped must account for every parsed message."""
+    data = [{
+        "uuid": "u1", "name": "Project-x convo",
+        "chat_messages": [
+            {"sender": "human", "text": "hello", "content": [],
+             "created_at": "2026-01-01T00:00:00Z"},
+            {"sender": "assistant", "text": "reply with a bad timestamp", "content": [],
+             "created_at": "not-a-real-date"},
+        ],
+    }]
+    export = _write_json(data)
+    try:
+        capsys.readouterr()  # clear
+        inserted, dupes = ingest.run(export, tmp_db, format_name="anthropic")
+        err = capsys.readouterr().err
+        assert inserted == 1
+        assert dupes == 0
+        assert "Skipped:    1" in err, "the skipped count must be surfaced in the summary"
+
+        total_parsed = 2
+        # No message may vanish: every parsed message is either inserted,
+        # a duplicate, or explicitly counted as skipped.
+        assert inserted + dupes + 1 == total_parsed
+    finally:
+        export.unlink(missing_ok=True)
+
+
 def test_grok_wrapped_conversations_streams():
     data = {"conversations": [{
         "conversation": {"id": "g1", "title": "Grok convo"},

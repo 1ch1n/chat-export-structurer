@@ -52,13 +52,20 @@ def _flush_thread(
     platform: str,
     account_id: str,
     source_id: str,
-) -> tuple[int, int]:
-    """Insert one thread's messages. Returns (inserted, duplicates).
+) -> tuple[int, int, int, str | None]:
+    """Insert one thread's messages. Returns (inserted, duplicates, skipped,
+    skipped_example).
 
     canonical_thread_id derives from the thread's chronologically-first
     message, and message_ids derive from the canonical id — identical to the
     pre-streaming implementation, so re-importing an export produced under
     either version dedups cleanly.
+
+    A message whose created_at can't be turned into a timestamp (parser
+    yielded 0.0 for an unparseable/missing source timestamp) is skipped
+    rather than inserted with a fabricated time. skipped_example carries the
+    thread_title of the first such message so callers can report one
+    concrete example instead of a per-message warning.
     """
     thread_messages.sort(key=lambda m: m["created_at"])
     first = thread_messages[0]
@@ -82,6 +89,8 @@ def _flush_thread(
 
     inserted = 0
     duplicates = 0
+    skipped = 0
+    skipped_example = None
     for msg in thread_messages:
         ts_round = round_epoch(msg["created_at"]) or 0
         message_id = sha1("|".join([
@@ -91,6 +100,9 @@ def _flush_thread(
 
         ts_iso = iso_from_epoch(msg["created_at"])
         if not ts_iso:
+            skipped += 1
+            if skipped_example is None:
+                skipped_example = msg.get("thread_title") or canonical_thread_id
             continue
 
         was_inserted = db.insert_message(
@@ -105,7 +117,7 @@ def _flush_thread(
             duplicates += 1
 
     con.commit()
-    return inserted, duplicates
+    return inserted, duplicates, skipped, skipped_example
 
 
 def run(
@@ -149,6 +161,8 @@ def run(
 
     inserted = 0
     duplicates = 0
+    skipped = 0
+    skipped_example = None
     threads_flushed = 0
     current_tid: str | None = None
     current: list[dict] = []
@@ -158,9 +172,14 @@ def run(
         for msg in parse(file_path, format_name):
             tid = msg["thread_id"]
             if current and tid != current_tid:
-                ins, dup = _flush_thread(con, current, platform, account_id, source_id)
+                ins, dup, skp, example = _flush_thread(
+                    con, current, platform, account_id, source_id
+                )
                 inserted += ins
                 duplicates += dup
+                skipped += skp
+                if skipped_example is None:
+                    skipped_example = example
                 threads_flushed += 1
                 progress.update(1)
                 current = []
@@ -168,9 +187,12 @@ def run(
             current.append(msg)
 
         if current:
-            ins, dup = _flush_thread(con, current, platform, account_id, source_id)
+            ins, dup, skp, example = _flush_thread(con, current, platform, account_id, source_id)
             inserted += ins
             duplicates += dup
+            skipped += skp
+            if skipped_example is None:
+                skipped_example = example
             threads_flushed += 1
             progress.update(1)
     finally:
@@ -198,6 +220,9 @@ def run(
     print(f"  Threads:    {threads_flushed}", file=sys.stderr)
     print(f"  Inserted:   {inserted}", file=sys.stderr)
     print(f"  Duplicates: {duplicates}", file=sys.stderr)
+    if skipped:
+        example = f" (e.g. '{skipped_example}')" if skipped_example else ""
+        print(f"  Skipped:    {skipped} — unparseable timestamp{example}", file=sys.stderr)
     print(f"  Total in DB: {total}", file=sys.stderr)
 
     return inserted, duplicates

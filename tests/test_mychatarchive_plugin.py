@@ -756,6 +756,47 @@ class TestSensitivityScope:
         entry = next(f for f in schema if f["key"] == "include_private")
         assert entry["default"] == "false"
 
+    def test_no_retrieval_call_site_ever_requests_sealed(self, mock_mca):
+        """End-to-end regression: exercise every code path that reaches
+        mychatarchive.db (prefetch, both mca_search modes, all three
+        mca_recall layers, mca_provenance's chunk branch) with the
+        strongest widening the plugin has (include_private=True), and
+        assert every single db call that accepts a scope both received one
+        and that it never contains "sealed". This is what the task
+        actually requires ("NEVER returns sealed even with [include_private]
+        enabled") -- checking provider._scope()'s return value alone (see
+        test_sealed_never_reachable_even_if_include_private_forced) proves
+        the helper is correct but not that every call site actually uses
+        it; a single call site missing `scope=` wouldn't be caught by that
+        test, or by the whole-file negative control, since the file would
+        still run and most assertions would still pass on the calls that
+        do pass scope.
+        """
+        provider, db, _, _ = mock_mca
+        provider._include_private = True
+
+        provider.prefetch("q")
+        provider.handle_tool_call("mca_search", {"query": "q", "mode": "hybrid"})
+        provider.handle_tool_call("mca_recall", {"topic": "q"})
+        provider.handle_tool_call("mca_provenance", {"chunk_id": "chunk-1"})
+
+        scoped_fns = (
+            db.search_chunks, db.get_chunk_by_id, db.fts_search,
+            db.search_thread_summaries, db.get_summary_by_id,
+            db.search_thoughts, db.get_thought_by_id, db.get_thread_summary,
+        )
+        checked = 0
+        for fn in scoped_fns:
+            for call in fn.call_args_list:
+                scope = call.kwargs.get("scope")
+                assert scope is not None, f"{fn._mock_name or fn} called without scope="
+                assert "sealed" not in scope, f"{fn._mock_name or fn} requested sealed scope"
+                checked += 1
+        assert checked >= len(scoped_fns), (
+            "expected at least one recorded call per scoped function -- "
+            "the exercised code paths above should hit all eight"
+        )
+
     def test_coerce_bool_handles_json_and_string_forms(self, mock_mca):
         mod = _plugin_module()
         assert mod._coerce_bool(True) is True

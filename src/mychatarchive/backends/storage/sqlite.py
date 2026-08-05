@@ -484,18 +484,24 @@ def ensure_schema(con: sqlite3.Connection):
 
 def insert_message(con: sqlite3.Connection, message_id: str, canonical_thread_id: str,
                    platform: str, account_id: str, ts: str, role: str, text: str,
-                   title: str, source_id: str) -> bool:
+                   title: str, source_id: str, *, sensitivity: str = "public") -> bool:
     """Insert a message. Returns True if inserted, False if duplicate.
 
     The external-content FTS index is maintained by the messages_fts_ai/au/ad
     triggers (see _create_messages_fts), so there is no manual FTS bookkeeping
     here. INSERT OR IGNORE that skips a duplicate does not fire the trigger.
+
+    sensitivity is set at insert time so a row entering an already-classified
+    thread is never briefly (or, after an interrupted import, permanently)
+    readable at a wider scope than its thread.
     """
+    _validate_level(sensitivity)
     cur = con.execute(
         "INSERT OR IGNORE INTO messages "
-        "(message_id, canonical_thread_id, platform, account_id, ts, role, text, title, source_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (message_id, canonical_thread_id, platform, account_id, ts, role, text, title, source_id),
+        "(message_id, canonical_thread_id, platform, account_id, ts, role, text, title, source_id, "
+        "sensitivity) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (message_id, canonical_thread_id, platform, account_id, ts, role, text, title, source_id,
+         sensitivity),
     )
     return cur.rowcount > 0
 
@@ -690,6 +696,12 @@ def search_chunks(
 
     if sort_by_time:
         matched.sort(key=lambda x: x[1] or "", reverse=True)
+    else:
+        # The re-query above returns rows in table order, not KNN order, so
+        # relevance ranking must be restored before truncating to `limit` —
+        # otherwise the best match can be cut or buried. Every default search
+        # takes this path (scope=("public",) makes needs_filter true).
+        matched.sort(key=lambda x: x[2])
 
     return [(c, d) for c, ts, d in matched[:limit]]
 

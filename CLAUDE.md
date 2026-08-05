@@ -38,5 +38,8 @@ planning, ranking, and final review.
   retrieval paths must enforce scope; sealed must remain unreachable via MCP.
 - CLI handlers: heavy imports function-local, errors to stderr + exit 1,
   results to stdout, `_add_db_arg` on every db-touching subparser leaf.
-- `_cmd_init` rebuilds config.json from a whitelist dict — new top-level
-  config keys must be added there or `init` silently deletes them.
+- `_cmd_init` starts from the existing config.json (`load_config()`) and only
+  `setdefault`s the keys it manages (storage, embeddings, transport,
+  drop_folder, auto_sources, sources) — it never rebuilds the dict from a
+  whitelist, so unrelated top-level keys (e.g. `summarize`) always survive
+  a re-run.

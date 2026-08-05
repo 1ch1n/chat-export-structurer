@@ -417,15 +417,19 @@ def _cmd_init():
         _DEFAULT_CHUNK_SIZE, _DEFAULT_CHUNK_OVERLAP,
     )
 
-    existing = load_config()
-    cfg = {
-        "storage": existing.get("storage", {}),
-        "embeddings": existing.get("embeddings", {}),
-        "transport": existing.get("transport", {}),
-        "drop_folder": existing.get("drop_folder", _DEFAULT_DROP_FOLDER),
-        "auto_sources": existing.get("auto_sources", dict(_AUTO_SOURCE_DEFAULTS)),
-        "sources": existing.get("sources", {}),
-    }
+    # Start from the existing config and only fill in the keys init actually
+    # manages (storage/embeddings/transport/drop_folder/auto_sources/sources)
+    # instead of rebuilding from a hardcoded whitelist. Any other top-level
+    # key (e.g. the `summarize` block written by `mychatarchive summarize`)
+    # survives untouched, so re-running init can never silently delete a
+    # config section it doesn't know about.
+    cfg = load_config()
+    cfg.setdefault("storage", {})
+    cfg.setdefault("embeddings", {})
+    cfg.setdefault("transport", {})
+    cfg.setdefault("drop_folder", _DEFAULT_DROP_FOLDER)
+    cfg.setdefault("auto_sources", dict(_AUTO_SOURCE_DEFAULTS))
+    cfg.setdefault("sources", {})
 
     print("MyChatArchive Setup")
     print("=" * 50)

@@ -35,19 +35,19 @@ def _make_mock_db():
         ("chunk-1", 0.3),
         ("chunk-2", 0.6),
     ]
-    db.get_chunk_by_id.side_effect = lambda con, cid: {
+    db.get_chunk_by_id.side_effect = lambda con, cid, **kw: {
         "chunk-1": ("First chunk text about projects", "thread-1", "2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z", '{"platform": "chatgpt", "title": "Project Chat"}'),
         "chunk-2": ("Second chunk about Python", "thread-2", "2026-02-01T00:00:00Z", "2026-02-01T00:01:00Z", '{"platform": "anthropic", "title": "Python Help"}'),
     }.get(cid)
     db.search_thread_summaries.return_value = [("summary-1", 0.4)]
-    db.get_summary_by_id.side_effect = lambda con, sid: {
+    db.get_summary_by_id.side_effect = lambda con, sid, **kw: {
         "summary-1": ("summary-1", "thread-1", 0, "Project Chat", "chatgpt", 10, "2026-01-01", "2026-01-02", "Discussion about projects", '["projects", "planning"]'),
     }.get(sid)
     db.search_thoughts.return_value = [("thought-1", 0.2)]
-    db.get_thought_by_id.side_effect = lambda con, tid: {
+    db.get_thought_by_id.side_effect = lambda con, tid, **kw: {
         "thought-1": ("A captured thought", "2026-03-01T00:00:00Z", '{"source": "hermes"}'),
     }.get(tid)
-    db.get_thread_summary.side_effect = lambda con, tid: {
+    db.get_thread_summary.side_effect = lambda con, tid, **kw: {
         "thread-1": ("summary-1", "thread-1", 0, "Project Chat", "chatgpt", 10, "2026-01-01", "2026-01-02", "Discussion about projects", '["projects"]'),
     }.get(tid)
     db.fts_search.return_value = [
@@ -140,6 +140,12 @@ def mock_mca(tmp_path):
         sys.modules["tools.registry"].tool_error = lambda msg, **kw: json.dumps({"error": msg})
 
         spec.loader.exec_module(mod)
+        # module_from_spec() does not register the module in sys.modules by
+        # itself; do it explicitly so tests can look up the real module
+        # (e.g. to call its module-level helpers) instead of accidentally
+        # matching one of the MagicMock stand-ins patched in above, whose
+        # hasattr() checks are vacuously true for any attribute name.
+        sys.modules["plugins.memory.mychatarchive"] = mod
 
         provider = mod.MyChatArchiveProvider()
 
@@ -676,3 +682,201 @@ class TestEmbeddingDimensionCheck:
         # Should raise when dimensions differ
         with pytest.raises(RuntimeError, match="Embedding dimension mismatch"):
             mod._validate_embedding_dimension(mock_con, 768)
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity scope: the plugin calls mychatarchive.db directly (bypassing
+# the MCP server), so it must enforce fail-closed scope itself. Regression
+# coverage for: retrieval calls used to omit `scope=` entirely, which
+# defaulted to public-only with no opt-in and no visible error -- a user's
+# own agent would silently lose access to their private content the moment
+# they classified it. Sealed must remain unreachable no matter what.
+# ---------------------------------------------------------------------------
+
+
+def _plugin_module():
+    # Loaded under this fixed name by the mock_mca fixture's
+    # spec_from_file_location call. Look it up directly rather than
+    # scanning sys.modules by substring -- several sys.modules entries in
+    # this fixture (e.g. "mychatarchive" itself) are MagicMocks whose
+    # hasattr() checks are vacuously true for any attribute name.
+    mod = sys.modules.get("plugins.memory.mychatarchive")
+    if mod is None or not hasattr(mod, "_coerce_bool"):
+        raise AssertionError("Real plugin module not found in sys.modules")
+    return mod
+
+
+class TestSensitivityScope:
+    def test_default_scope_is_public_only(self, mock_mca):
+        provider, db, _, _ = mock_mca
+        assert provider._include_private is False  # __init__ default
+        provider.handle_tool_call("mca_search", {"query": "test"})
+        assert db.search_chunks.call_args.kwargs.get("scope") == ("public",)
+
+    def test_include_private_widens_search_scope(self, mock_mca):
+        provider, db, _, _ = mock_mca
+        provider._include_private = True
+        provider.handle_tool_call("mca_search", {"query": "test", "mode": "hybrid"})
+        assert db.search_chunks.call_args.kwargs.get("scope") == ("public", "private")
+        assert db.fts_search.call_args.kwargs.get("scope") == ("public", "private")
+
+    def test_recall_threads_scope_through_all_three_layers(self, mock_mca):
+        provider, db, _, _ = mock_mca
+        provider._include_private = True
+        provider.handle_tool_call("mca_recall", {"topic": "test"})
+        assert db.search_chunks.call_args.kwargs.get("scope") == ("public", "private")
+        assert db.search_thread_summaries.call_args.kwargs.get("scope") == ("public", "private")
+        assert db.search_thoughts.call_args.kwargs.get("scope") == ("public", "private")
+
+    def test_prefetch_threads_scope(self, mock_mca):
+        provider, db, _, _ = mock_mca
+        provider.prefetch("query")
+        assert db.search_chunks.call_args.kwargs.get("scope") == ("public",)
+        provider._include_private = True
+        provider.prefetch("query")
+        assert db.search_chunks.call_args.kwargs.get("scope") == ("public", "private")
+
+    def test_sealed_never_reachable_even_if_include_private_forced(self, mock_mca):
+        # There is no config value or parameter that can add "sealed" to
+        # scope -- _scope() filters through _PLUGIN_ALLOWED_LEVELS, which
+        # only lists public/private. Forcing include_private (the strongest
+        # widening available) must still never surface sealed.
+        provider, _, _, _ = mock_mca
+        provider._include_private = True
+        assert "sealed" not in provider._scope()
+        assert set(provider._scope()) <= {"public", "private"}
+
+    def test_plugin_allowed_levels_excludes_sealed(self, mock_mca):
+        mod = _plugin_module()
+        assert "sealed" not in mod._PLUGIN_ALLOWED_LEVELS
+
+    def test_config_schema_includes_include_private_default_false(self, mock_mca):
+        provider, _, _, _ = mock_mca
+        schema = provider.get_config_schema()
+        entry = next(f for f in schema if f["key"] == "include_private")
+        assert entry["default"] == "false"
+
+    def test_no_retrieval_call_site_ever_requests_sealed(self, mock_mca):
+        """End-to-end regression: exercise every code path that reaches
+        mychatarchive.db (prefetch, both mca_search modes, all three
+        mca_recall layers, mca_provenance's chunk branch) with the
+        strongest widening the plugin has (include_private=True), and
+        assert every single db call that accepts a scope both received one
+        and that it never contains "sealed". This is what the task
+        actually requires ("NEVER returns sealed even with [include_private]
+        enabled") -- checking provider._scope()'s return value alone (see
+        test_sealed_never_reachable_even_if_include_private_forced) proves
+        the helper is correct but not that every call site actually uses
+        it; a single call site missing `scope=` wouldn't be caught by that
+        test, or by the whole-file negative control, since the file would
+        still run and most assertions would still pass on the calls that
+        do pass scope.
+        """
+        provider, db, _, _ = mock_mca
+        provider._include_private = True
+
+        provider.prefetch("q")
+        provider.handle_tool_call("mca_search", {"query": "q", "mode": "hybrid"})
+        provider.handle_tool_call("mca_recall", {"topic": "q"})
+        provider.handle_tool_call("mca_provenance", {"chunk_id": "chunk-1"})
+
+        scoped_fns = (
+            db.search_chunks, db.get_chunk_by_id, db.fts_search,
+            db.search_thread_summaries, db.get_summary_by_id,
+            db.search_thoughts, db.get_thought_by_id, db.get_thread_summary,
+        )
+        checked = 0
+        for fn in scoped_fns:
+            for call in fn.call_args_list:
+                scope = call.kwargs.get("scope")
+                assert scope is not None, f"{fn._mock_name or fn} called without scope="
+                assert "sealed" not in scope, f"{fn._mock_name or fn} requested sealed scope"
+                checked += 1
+        assert checked >= len(scoped_fns), (
+            "expected at least one recorded call per scoped function -- "
+            "the exercised code paths above should hit all eight"
+        )
+
+    def test_coerce_bool_handles_json_and_string_forms(self, mock_mca):
+        mod = _plugin_module()
+        assert mod._coerce_bool(True) is True
+        assert mod._coerce_bool(False) is False
+        assert mod._coerce_bool("true") is True
+        assert mod._coerce_bool("false") is False
+        assert mod._coerce_bool("1") is True
+        assert mod._coerce_bool("0") is False
+        assert mod._coerce_bool(None) is False
+        assert mod._coerce_bool("") is False
+
+
+class TestProvenanceHonesty:
+    """mca_provenance used to report a flat 'not found' for both a
+    genuinely-absent row and a row that exists but is outside scope
+    (private, with include_private off) -- telling the user their data
+    was lost when it was merely restricted."""
+
+    def test_private_chunk_reports_restricted_not_missing(self, mock_mca):
+        provider, db, _, _ = mock_mca
+        provider._include_private = False
+
+        def side_effect(con, cid, **kw):
+            if cid != "priv-chunk":
+                return None
+            # Absent at the plugin's own (public-only) scope, present once
+            # widened to public+private -- i.e. genuinely exists, just private.
+            if kw.get("scope") == ("public",):
+                return None
+            return ("private text", "thread-9", "2026-01-01", "2026-01-01", "{}")
+
+        db.get_chunk_by_id.side_effect = side_effect
+        result = json.loads(provider.handle_tool_call(
+            "mca_provenance", {"chunk_id": "priv-chunk"},
+        ))
+        assert "error" in result
+        assert "private" in result["error"].lower()
+        assert "not found" not in result["error"].lower()
+
+    def test_genuinely_missing_chunk_still_reports_not_found(self, mock_mca):
+        provider, db, _, _ = mock_mca
+        provider._include_private = False
+        db.get_chunk_by_id.side_effect = lambda con, cid, **kw: None
+        result = json.loads(provider.handle_tool_call(
+            "mca_provenance", {"chunk_id": "ghost-chunk"},
+        ))
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+    def test_private_thought_reports_restricted_not_missing(self, mock_mca):
+        provider, db, _, _ = mock_mca
+        provider._include_private = False
+
+        def side_effect(con, tid, **kw):
+            if tid != "priv-thought":
+                return None
+            if kw.get("scope") == ("public",):
+                return None
+            return ("private thought text", "2026-01-01", "{}")
+
+        db.get_thought_by_id.side_effect = side_effect
+        result = json.loads(provider.handle_tool_call(
+            "mca_provenance", {"thought_id": "priv-thought"},
+        ))
+        assert "error" in result
+        assert "private" in result["error"].lower()
+        assert "not found" not in result["error"].lower()
+
+    def test_include_private_on_returns_content_directly_no_restriction_message(self, mock_mca):
+        provider, db, _, _ = mock_mca
+        provider._include_private = True
+
+        def side_effect(con, cid, **kw):
+            if cid == "priv-chunk" and kw.get("scope") == ("public", "private"):
+                return ("private text", "thread-9", "2026-01-01", "2026-01-01", "{}")
+            return None
+
+        db.get_chunk_by_id.side_effect = side_effect
+        result = json.loads(provider.handle_tool_call(
+            "mca_provenance", {"chunk_id": "priv-chunk"},
+        ))
+        assert result.get("type") == "chunk"
+        assert result.get("text") == "private text"

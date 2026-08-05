@@ -417,15 +417,19 @@ def _cmd_init():
         _DEFAULT_CHUNK_SIZE, _DEFAULT_CHUNK_OVERLAP,
     )
 
-    existing = load_config()
-    cfg = {
-        "storage": existing.get("storage", {}),
-        "embeddings": existing.get("embeddings", {}),
-        "transport": existing.get("transport", {}),
-        "drop_folder": existing.get("drop_folder", _DEFAULT_DROP_FOLDER),
-        "auto_sources": existing.get("auto_sources", dict(_AUTO_SOURCE_DEFAULTS)),
-        "sources": existing.get("sources", {}),
-    }
+    # Start from the existing config and only fill in the keys init actually
+    # manages (storage/embeddings/transport/drop_folder/auto_sources/sources)
+    # instead of rebuilding from a hardcoded whitelist. Any other top-level
+    # key (e.g. the `summarize` block written by `mychatarchive summarize`)
+    # survives untouched, so re-running init can never silently delete a
+    # config section it doesn't know about.
+    cfg = load_config()
+    cfg.setdefault("storage", {})
+    cfg.setdefault("embeddings", {})
+    cfg.setdefault("transport", {})
+    cfg.setdefault("drop_folder", _DEFAULT_DROP_FOLDER)
+    cfg.setdefault("auto_sources", dict(_AUTO_SOURCE_DEFAULTS))
+    cfg.setdefault("sources", {})
 
     print("MyChatArchive Setup")
     print("=" * 50)
@@ -1114,10 +1118,12 @@ def _cmd_classify(args, db_path: Path):
     # reading it, so it must never fire by accident.
     if args.query:
         # Classification tooling must see everything, or already-classified
-        # content could never be re-classified.
-        matches = db.fts_search(con, args.query, limit=10000,
-                                scope=db.SENSITIVITY_LEVELS)
-        thread_ids = sorted({row[2] for row in matches})
+        # content could never be re-classified. Uses the uncapped
+        # thread-id-only lookup (not fts_search's row-limited message search)
+        # so a keyword matching more than any row cap still classifies every
+        # matching thread, not just the top-N matching messages.
+        thread_ids = sorted(db.fts_search_thread_ids(con, args.query,
+                                                       scope=db.SENSITIVITY_LEVELS))
         selector_desc = f"threads with keyword match for {args.query!r}"
     else:
         import datetime

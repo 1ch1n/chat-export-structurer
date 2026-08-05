@@ -321,3 +321,53 @@ def test_reconcile_raises_new_rows_to_thread_level(env):
     # All-public threads are never touched, and reconcile never lowers levels
     assert store.reconcile_thread_sensitivity(con) == 0
     assert store.get_thread_sensitivity(con, "pub") == ("public", 1)
+
+
+# ── Uncapped thread-id lookup for bulk classification (bug: 10k row cap) ──────
+
+def test_fts_search_thread_ids_scoped(env):
+    con, *_ = env
+    _seed_three_levels(con)
+    ids = set(store.fts_search_thread_ids(con, "SECRET"))
+    assert ids == {"pub"}
+    ids = set(store.fts_search_thread_ids(con, "SECRET", scope=("public", "private")))
+    assert ids == {"pub", "priv"}
+    ids = set(store.fts_search_thread_ids(con, "SECRET", scope=store.SENSITIVITY_LEVELS))
+    assert ids == {"pub", "priv", "seal"}
+
+
+def test_fts_search_thread_ids_empty_group_set_returns_nothing(env):
+    con, *_ = env
+    _seed_three_levels(con)
+    assert store.fts_search_thread_ids(con, "SECRET", group_thread_ids=set(),
+                                       scope=store.SENSITIVITY_LEVELS) == []
+
+
+def test_fts_search_thread_ids_covers_every_matching_thread_beyond_any_row_cap(env):
+    """Regression for the classify --query row cap: a message-row-limited
+    search (the old ``fts_search(..., limit=N)`` approach) can silently miss
+    threads whose matches fall outside the cap, even though thread count is
+    far smaller than message count. The dedicated thread-id lookup must
+    return every matching thread regardless of how many messages match.
+
+    N=25 threads is a synthetic stand-in for "more threads than any row cap"
+    -- the assertion pattern (row-limited search misses threads that the
+    uncapped lookup finds) is what would have failed against the real
+    limit=10000 cap on a large archive; testing at N=10000 would just make
+    this test slow without proving anything more.
+    """
+    con, *_ = env
+    n = 25
+    cap = 10
+    for i in range(n):
+        _msg(con, f"m-{i}", f"thread-{i}", "WIDGET rollout notes")
+
+    # Old approach: derive thread ids from a row-limited message search.
+    capped_rows = store.fts_search(con, "WIDGET", limit=cap, scope=store.SENSITIVITY_LEVELS)
+    capped_thread_ids = {row[2] for row in capped_rows}
+    assert len(capped_rows) == cap
+    assert len(capped_thread_ids) < n  # some threads silently dropped by the cap
+
+    # New approach: dedicated uncapped thread-id lookup finds all of them.
+    all_thread_ids = set(store.fts_search_thread_ids(con, "WIDGET", scope=store.SENSITIVITY_LEVELS))
+    assert all_thread_ids == {f"thread-{i}" for i in range(n)}

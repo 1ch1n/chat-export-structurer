@@ -13,6 +13,13 @@ Config via $HERMES_HOME/mychatarchive.json (profile-scoped):
   db_path:         path to the MCA SQLite database (default: ~/.mychatarchive/archive.db)
   recall_mode:     hybrid | context | tools (default: hybrid)
   prefetch_limit:  max chunks injected per turn (default: 5)
+  include_private: also retrieve content classified private (default: false)
+
+Sensitivity scope: this plugin calls mychatarchive.db directly, bypassing
+the MCP server, so it enforces the same fail-closed scope itself. Default
+scope is public-only; include_private widens it to public+private. Sealed
+is never reachable here, by construction (see _PLUGIN_ALLOWED_LEVELS below)
+-- mirrors src/mychatarchive/mcp/server.py's _scope()/_MCP_ALLOWED_LEVELS.
 """
 
 from __future__ import annotations
@@ -163,6 +170,27 @@ MCA_PROVENANCE_SCHEMA = {
 
 
 # ---------------------------------------------------------------------------
+# Sensitivity scope
+# ---------------------------------------------------------------------------
+
+# This plugin calls mychatarchive.db directly (bypassing the MCP server), so
+# it must enforce the same fail-closed sensitivity scope itself. Sealed is
+# never included here at all -- no config value or code path can widen scope
+# to contain it -- mirroring mcp/server.py's _MCP_ALLOWED_LEVELS allowlist.
+_PLUGIN_ALLOWED_LEVELS = ("public", "private")
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Lenient bool coercion for config values that may arrive as JSON bool,
+    a string ("true"/"false"/"1"/"0"), or be absent entirely."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+# ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
 
@@ -293,6 +321,7 @@ class MyChatArchiveProvider(MemoryProvider):
         self._hermes_home: str = ""
         self._recall_mode: str = "hybrid"
         self._prefetch_limit: int = 5
+        self._include_private: bool = False
         self._sync_thread: Optional[threading.Thread] = None
 
     @property
@@ -333,6 +362,15 @@ class MyChatArchiveProvider(MemoryProvider):
                 "key": "prefetch_limit",
                 "description": "Max chunks auto-injected per turn",
                 "default": "5",
+            },
+            {
+                "key": "include_private",
+                "description": (
+                    "Also retrieve content classified private. Sealed content is "
+                    "never retrieved by this plugin, regardless of this setting."
+                ),
+                "default": "false",
+                "choices": ["true", "false"],
             },
         ]
 
@@ -468,6 +506,11 @@ class MyChatArchiveProvider(MemoryProvider):
             self._prefetch_limit = int(self._config.get("prefetch_limit", 5))
         except (ValueError, TypeError):
             self._prefetch_limit = 5
+        # Fail closed to public-only, matching the MCP server's default --
+        # a user must explicitly opt in to widen their own agent's access to
+        # content they've classified private. Sealed is never reachable here
+        # regardless of this setting (see _scope() / _PLUGIN_ALLOWED_LEVELS).
+        self._include_private = _coerce_bool(self._config.get("include_private", False))
 
         db_path = _resolve_db_path(self._config)
         if not db_path.exists():
@@ -567,13 +610,14 @@ class MyChatArchiveProvider(MemoryProvider):
             embedding = self._embeddings.embed_single(query)
             results = self._db.search_chunks(
                 self._con, embedding, limit=self._prefetch_limit,
+                scope=self._scope(),
             )
             if not results:
                 return ""
 
             lines: List[str] = []
             for chunk_id, distance in results:
-                row = self._db.get_chunk_by_id(self._con, chunk_id)
+                row = self._db.get_chunk_by_id(self._con, chunk_id, scope=self._scope())
                 if not row:
                     continue
                 text, thread_id, ts_start, ts_end, meta_json = row
@@ -669,6 +713,39 @@ class MyChatArchiveProvider(MemoryProvider):
         self._db = None
         self._embeddings = None
 
+    # -- Sensitivity scope -----------------------------------------------
+
+    def _scope(self) -> tuple:
+        """Resolve the plugin's current sensitivity scope.
+
+        Mirrors mcp/server.py's _scope(): defaults to public-only, widens to
+        public+private when include_private is set, and filters through the
+        _PLUGIN_ALLOWED_LEVELS allowlist so sealed can never appear here even
+        if this function is edited carelessly in the future.
+        """
+        scope = ("public", "private") if self._include_private else ("public",)
+        return tuple(s for s in scope if s in _PLUGIN_ALLOWED_LEVELS)
+
+    def _restricted_message(self, kind: str, item_id: str, lookup) -> str:
+        """Build an honest "not found" message for a direct-ID provenance lookup.
+
+        A row that's absent and a row that exists but is outside the current
+        scope both come back as None from `lookup`, and it used to be
+        impossible to tell them apart -- mca_provenance reported "not found"
+        either way, which tells the user their data was lost when it was
+        merely restricted. If include_private is off, re-check against
+        public+private (never sealed -- that scope stays unreachable
+        regardless) to see whether the gap is explained by private access
+        being off; if so, say so instead of claiming the data doesn't exist.
+        """
+        if not self._include_private:
+            if lookup(self._con, item_id, scope=("public", "private")) is not None:
+                return (
+                    f"{kind} {item_id} exists but is classified private. "
+                    f"Enable include_private in the mychatarchive plugin config to access it."
+                )
+        return f"{kind} not found: {item_id}"
+
     # -- Tool handlers -------------------------------------------------------
 
     def _handle_search(self, args: dict) -> str:
@@ -696,13 +773,13 @@ class MyChatArchiveProvider(MemoryProvider):
             hits = self._db.search_chunks(
                 self._con, embedding, limit=limit,
                 platform=platform, cutoff_iso=cutoff,
-                group_thread_ids=group_ids,
+                group_thread_ids=group_ids, scope=self._scope(),
             )
             for chunk_id, distance in hits:
                 if chunk_id in seen_ids:
                     continue
                 seen_ids.add(chunk_id)
-                row = self._db.get_chunk_by_id(self._con, chunk_id)
+                row = self._db.get_chunk_by_id(self._con, chunk_id, scope=self._scope())
                 if not row:
                     continue
                 text, thread_id, ts_start, ts_end, meta_json = row
@@ -722,7 +799,7 @@ class MyChatArchiveProvider(MemoryProvider):
             fts_hits = self._db.fts_search(
                 self._con, query, limit=limit,
                 platform=platform, cutoff_iso=cutoff,
-                group_thread_ids=group_ids,
+                group_thread_ids=group_ids, scope=self._scope(),
             )
             for row in fts_hits:
                 msg_id, text, thread_id, ts, role, title = (
@@ -761,10 +838,10 @@ class MyChatArchiveProvider(MemoryProvider):
         messages: List[dict] = []
         chunk_hits = self._db.search_chunks(
             self._con, embedding, limit=limit,
-            platform=platform, group_thread_ids=group_ids,
+            platform=platform, group_thread_ids=group_ids, scope=self._scope(),
         )
         for chunk_id, distance in chunk_hits:
-            row = self._db.get_chunk_by_id(self._con, chunk_id)
+            row = self._db.get_chunk_by_id(self._con, chunk_id, scope=self._scope())
             if not row:
                 continue
             text, thread_id, ts_start, ts_end, meta_json = row
@@ -783,10 +860,10 @@ class MyChatArchiveProvider(MemoryProvider):
         # search_thread_summaries does not accept those params)
         summaries: List[dict] = []
         summary_hits = self._db.search_thread_summaries(
-            self._con, embedding, limit=limit * 3,
+            self._con, embedding, limit=limit * 3, scope=self._scope(),
         )
         for summary_id, distance in summary_hits:
-            row = self._db.get_summary_by_id(self._con, summary_id)
+            row = self._db.get_summary_by_id(self._con, summary_id, scope=self._scope())
             if not row:
                 continue
             # 10-col: summary_id, thread_id, segment_index, title,
@@ -818,9 +895,11 @@ class MyChatArchiveProvider(MemoryProvider):
 
         # Layer 3: captured thoughts
         thoughts: List[dict] = []
-        thought_hits = self._db.search_thoughts(self._con, embedding, limit=limit)
+        thought_hits = self._db.search_thoughts(
+            self._con, embedding, limit=limit, scope=self._scope(),
+        )
         for thought_id, distance in thought_hits:
-            row = self._db.get_thought_by_id(self._con, thought_id)
+            row = self._db.get_thought_by_id(self._con, thought_id, scope=self._scope())
             if not row:
                 continue
             text, created_at, meta_json = row
@@ -879,9 +958,11 @@ class MyChatArchiveProvider(MemoryProvider):
             return tool_error("Provide only one of chunk_id or thought_id, not both.")
 
         if chunk_id:
-            row = self._db.get_chunk_by_id(self._con, chunk_id)
+            row = self._db.get_chunk_by_id(self._con, chunk_id, scope=self._scope())
             if not row:
-                return tool_error(f"Chunk not found: {chunk_id}")
+                return tool_error(
+                    self._restricted_message("Chunk", chunk_id, self._db.get_chunk_by_id)
+                )
             text, thread_id, ts_start, ts_end, meta_json = row
             meta = _parse_meta(meta_json)
 
@@ -889,7 +970,7 @@ class MyChatArchiveProvider(MemoryProvider):
             thread_title = meta.get("title", "")
             thread_summary = ""
             thread_platform = meta.get("platform", "")
-            summary_row = self._db.get_thread_summary(self._con, thread_id)
+            summary_row = self._db.get_thread_summary(self._con, thread_id, scope=self._scope())
             if summary_row:
                 thread_title = thread_title or summary_row[3] or ""
                 thread_platform = thread_platform or summary_row[4] or ""
@@ -909,9 +990,11 @@ class MyChatArchiveProvider(MemoryProvider):
             })
 
         # thought_id path
-        row = self._db.get_thought_by_id(self._con, thought_id)
+        row = self._db.get_thought_by_id(self._con, thought_id, scope=self._scope())
         if not row:
-            return tool_error(f"Thought not found: {thought_id}")
+            return tool_error(
+                self._restricted_message("Thought", thought_id, self._db.get_thought_by_id)
+            )
         text, created_at, meta_json = row
         meta = _parse_meta(meta_json)
 

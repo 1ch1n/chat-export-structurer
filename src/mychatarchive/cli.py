@@ -1095,6 +1095,12 @@ def _cmd_classify(args, db_path: Path):
             print(f"Thread '{args.thread}' not found.", file=sys.stderr)
             con.close()
             sys.exit(1)
+        if args.dry_run:
+            print(f"Thread {args.thread}: {current[0]} -> {args.level} "
+                  f"({current[1]} messages, plus their chunks and summaries)")
+            print("\nDry run - nothing changed.")
+            con.close()
+            return
         _warn_if_sealed()
         counts = db.set_thread_sensitivity(con, [args.thread], args.level)
         con.close()

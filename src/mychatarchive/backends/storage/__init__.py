@@ -88,6 +88,13 @@ class StorageBackend(Protocol):
         group_thread_ids: set[str] | None = None,
         *, scope: tuple = DEFAULT_SCOPE,
     ) -> list: ...
+    def fts_search_thread_ids(
+        self, con, query: str,
+        platform: str | list[str] | None = None,
+        cutoff_iso: str | None = None,
+        group_thread_ids: set[str] | None = None,
+        *, scope: tuple = DEFAULT_SCOPE,
+    ) -> list[str]: ...
     def search_thread_summaries(
         self, con, embedding: list[float], limit: int = 10,
         *, scope: tuple = DEFAULT_SCOPE,

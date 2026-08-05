@@ -137,6 +137,27 @@ def fts_search(
     )
 
 
+def fts_search_thread_ids(
+    con,
+    query: str,
+    platform: str | list[str] | None = None,
+    cutoff_iso: str | None = None,
+    group_thread_ids: set | None = None,
+    *,
+    scope: tuple = DEFAULT_SCOPE,
+) -> list[str]:
+    """Distinct thread ids with at least one FTS match, uncapped.
+
+    Unlike fts_search (which caps rows via `limit` for interactive display),
+    this has no row cap — it's for callers (bulk classification) that need
+    every matching thread, not just the top-N matching messages.
+    """
+    return _b().fts_search_thread_ids(
+        con, query, platform=platform, cutoff_iso=cutoff_iso,
+        group_thread_ids=group_thread_ids, scope=scope,
+    )
+
+
 def get_recent_chunks(
     con,
     cutoff_iso: str,

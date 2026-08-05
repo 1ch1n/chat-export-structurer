@@ -802,6 +802,50 @@ def fts_search(
     return con.execute(sql, params).fetchall()
 
 
+def fts_search_thread_ids(
+    con: sqlite3.Connection,
+    query: str,
+    platform: str | list[str] | None = None,
+    cutoff_iso: str | None = None,
+    group_thread_ids: set[str] | None = None,
+    *,
+    scope: tuple = _DEFAULT_SCOPE,
+) -> list[str]:
+    """Distinct thread ids with at least one FTS match, uncapped.
+
+    Bulk classification needs every matching thread, not just the top-N
+    matching messages — thread count is far smaller than message count, so
+    selecting distinct thread ids with no row LIMIT is cheap and bounded
+    (bounded by thread count, not match count).
+    """
+    if group_thread_ids is not None and not group_thread_ids:
+        return []
+    scope_sql, scope_params = _scope_sql(scope, "m.sensitivity")
+    match = _build_fts_match(query)
+    if not match:
+        return []
+    sql = f"""
+        SELECT DISTINCT m.canonical_thread_id
+        FROM messages_fts f
+        JOIN messages m ON m.rowid = f.rowid
+        WHERE messages_fts MATCH ? AND {scope_sql}
+    """
+    params: list = [match, *scope_params]
+    if platform:
+        platforms = [platform] if isinstance(platform, str) else platform
+        placeholders = ",".join("?" * len(platforms))
+        sql += f" AND m.platform IN ({placeholders})"
+        params.extend(platforms)
+    if cutoff_iso:
+        sql += " AND m.ts >= ?"
+        params.append(cutoff_iso)
+    if group_thread_ids:
+        placeholders = ",".join("?" * len(group_thread_ids))
+        sql += f" AND m.canonical_thread_id IN ({placeholders})"
+        params.extend(group_thread_ids)
+    return [r[0] for r in con.execute(sql, params).fetchall()]
+
+
 def get_recent_chunks(
     con: sqlite3.Connection,
     cutoff_iso: str,

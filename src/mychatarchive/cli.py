@@ -1114,10 +1114,12 @@ def _cmd_classify(args, db_path: Path):
     # reading it, so it must never fire by accident.
     if args.query:
         # Classification tooling must see everything, or already-classified
-        # content could never be re-classified.
-        matches = db.fts_search(con, args.query, limit=10000,
-                                scope=db.SENSITIVITY_LEVELS)
-        thread_ids = sorted({row[2] for row in matches})
+        # content could never be re-classified. Uses the uncapped
+        # thread-id-only lookup (not fts_search's row-limited message search)
+        # so a keyword matching more than any row cap still classifies every
+        # matching thread, not just the top-N matching messages.
+        thread_ids = sorted(db.fts_search_thread_ids(con, args.query,
+                                                       scope=db.SENSITIVITY_LEVELS))
         selector_desc = f"threads with keyword match for {args.query!r}"
     else:
         import datetime

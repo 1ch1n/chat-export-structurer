@@ -162,3 +162,75 @@ def test_sqlite_export_refuses_sealed_without_flag(tmp_path, monkeypatch, capsys
          monkeypatch)
     assert "copied" in capsys.readouterr().out
     assert out_file.exists()
+
+
+def _seed_many_matching_threads(tmp_path, n):
+    """n threads, each with one message matching 'WIDGET', plus one distractor
+    thread that does not match. Synthetic stand-in for "more matching threads
+    than any row cap" -- see test_fts_search_thread_ids_covers_every_matching_
+    thread_beyond_any_row_cap in test_sensitivity.py for the storage-level
+    version of this regression at the point where it actually bites (a
+    message-row LIMIT, not a thread count)."""
+    from mychatarchive.backends.storage import sqlite as store
+
+    db_file = tmp_path / "archive.db"
+    con = store.get_connection(db_file)
+    store.ensure_schema(con)
+    for i in range(n):
+        store.insert_message(con, f"m-{i}", f"thread-{i}", "chatgpt", "main",
+                             "2024-01-01T00:00:00", "user",
+                             "WIDGET rollout notes", f"Title {i}", "s")
+    store.insert_message(con, "m-distractor", "t-other", "chatgpt", "main",
+                         "2024-01-01T00:00:00", "user",
+                         "unrelated content", "Other", "s")
+    con.commit()
+    con.close()
+    return db_file
+
+
+def test_classify_query_covers_every_matching_thread(tmp_path, monkeypatch, capsys):
+    # Regression: --query used to derive thread_ids from a row-limited
+    # fts_search (limit=10000), so threads whose match fell outside that cap
+    # were never classified. Every matching thread must be covered.
+    n = 15
+    db_file = _seed_many_matching_threads(tmp_path, n)
+
+    _run(["classify", "--query", "WIDGET", "--level", "private", "--confirm",
+          "--db", str(db_file)], monkeypatch)
+    out = capsys.readouterr().out
+    assert f"Applied 'private' to {n:,} threads" in out
+
+    con = sqlite3.connect(db_file)
+    levels = dict(con.execute("SELECT canonical_thread_id, sensitivity FROM messages"))
+    con.close()
+    assert all(levels[f"thread-{i}"] == "private" for i in range(n))
+    assert levels["t-other"] == "public"  # non-matching thread untouched
+
+
+def test_classify_query_uses_uncapped_thread_lookup(tmp_path, monkeypatch, capsys):
+    # Wiring check: --query selection must go through the dedicated uncapped
+    # fts_search_thread_ids, not the row-limited fts_search used for
+    # interactive message search/display.
+    db_file = _seed_many_matching_threads(tmp_path, 3)
+
+    from mychatarchive import db as db_module
+    calls = {"fts_search": 0, "fts_search_thread_ids": 0}
+    orig_fts_search = db_module.fts_search
+    orig_thread_ids = db_module.fts_search_thread_ids
+
+    def spy_fts_search(*a, **k):
+        calls["fts_search"] += 1
+        return orig_fts_search(*a, **k)
+
+    def spy_thread_ids(*a, **k):
+        calls["fts_search_thread_ids"] += 1
+        return orig_thread_ids(*a, **k)
+
+    monkeypatch.setattr(db_module, "fts_search", spy_fts_search)
+    monkeypatch.setattr(db_module, "fts_search_thread_ids", spy_thread_ids)
+
+    _run(["classify", "--query", "WIDGET", "--level", "private", "--confirm",
+          "--db", str(db_file)], monkeypatch)
+
+    assert calls["fts_search_thread_ids"] == 1
+    assert calls["fts_search"] == 0

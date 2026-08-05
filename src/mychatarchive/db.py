@@ -185,6 +185,11 @@ def has_thread_summary(con, canonical_thread_id: str) -> bool:
     return _b().has_thread_summary(con, canonical_thread_id)
 
 
+def get_thread_summary_segment_counts(con, canonical_thread_id: str) -> dict:
+    """Return {segment_index: message_count} for a thread's stored segments."""
+    return _b().get_thread_summary_segment_counts(con, canonical_thread_id)
+
+
 def insert_thread_summary(
     con,
     summary_id: str,

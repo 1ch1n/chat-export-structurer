@@ -1,11 +1,14 @@
 """Parser for Claude Code conversation history (~/.claude/projects/)."""
 
 import json
+import logging
 import os
 import platform
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 
 def _default_claude_dir() -> Path:
@@ -31,8 +34,8 @@ def _discover_sessions(claude_dir: Path) -> list[dict]:
             try:
                 with open(index_path, "r", encoding="utf-8") as f:
                     index_data = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.debug("Skipping unreadable sessions index %s: %s", index_path, exc)
 
         entries_by_id = {}
         for entry in index_data.get("entries", []):

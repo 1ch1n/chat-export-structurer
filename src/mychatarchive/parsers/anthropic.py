@@ -1,9 +1,12 @@
 """Parser for Anthropic Claude conversation exports."""
 
+import logging
 from datetime import datetime
 from typing import Iterator
 
 import ijson
+
+logger = logging.getLogger(__name__)
 
 
 def parse(input_path: str) -> Iterator[dict]:
@@ -47,7 +50,10 @@ def _parse_conversation(convo: dict) -> Iterator[dict]:
         try:
             dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
             created_at = dt.timestamp()
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, TypeError, AttributeError) as exc:
+            logger.debug(
+                "Unparseable created_at %r in thread %r: %s", created_at_str, thread_id, exc,
+            )
             created_at = 0.0
 
         yield {

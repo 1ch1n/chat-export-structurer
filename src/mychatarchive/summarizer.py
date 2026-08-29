@@ -34,7 +34,7 @@ import urllib.request
 from pathlib import Path
 
 try:
-    from tqdm import tqdm
+    from tqdm import tqdm  # noqa: F401 -- availability probe; re-imported where used below
     _HAS_TQDM = True
 except ImportError:
     _HAS_TQDM = False
@@ -86,7 +86,7 @@ def _segment_messages(messages: list[dict], per_segment: int) -> list[list[dict]
 
 def _segment_ts(messages: list[dict]) -> tuple[str | None, str | None]:
     """Return (ts_start, ts_end) for a list of messages."""
-    timestamps = [m.get("ts") for m in messages if m.get("ts")]
+    timestamps = [str(t) for m in messages if (t := m.get("ts"))]
     if not timestamps:
         return None, None
     return min(timestamps), max(timestamps)
@@ -255,7 +255,11 @@ def run(
                   file=sys.stderr)
 
     processed = errors = total_segments = 0
-    iterator = tqdm(threads, desc="Summarizing", unit="thread") if _HAS_TQDM else threads
+    if _HAS_TQDM:
+        from tqdm import tqdm  # re-import: keeps type checkers from seeing tqdm as possibly unbound
+        iterator = tqdm(threads, desc="Summarizing", unit="thread")
+    else:
+        iterator = threads
 
     for thread_meta in iterator:
         thread_id = thread_meta["canonical_thread_id"]

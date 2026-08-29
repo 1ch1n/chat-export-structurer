@@ -71,7 +71,7 @@ def load_config() -> dict:
     path = get_config_path()
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
@@ -80,7 +80,7 @@ def load_config() -> dict:
 def save_config(cfg: dict):
     path = get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cfg, indent=2))
+    path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 
 def get_embedding_model() -> str:

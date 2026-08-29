@@ -292,6 +292,16 @@ def main():
         help="Port for SSE transport (default: 8420)",
     )
     serve_p.add_argument(
+        "--host",
+        default="127.0.0.1",
+        metavar="ADDRESS",
+        help=(
+            "Bind address for SSE transport (default: 127.0.0.1, localhost only). "
+            "Pass 0.0.0.0 to accept LAN connections -- only do this alongside "
+            "--ssl-certfile/--ssl-keyfile."
+        ),
+    )
+    serve_p.add_argument(
         "--ssl-certfile",
         default=None,
         metavar="PATH",
@@ -1188,6 +1198,7 @@ def _cmd_serve(args, db_path: Path):
         port=args.port,
         ssl_certfile=getattr(args, "ssl_certfile", None),
         ssl_keyfile=getattr(args, "ssl_keyfile", None),
+        host=getattr(args, "host", None),
     )
 
 

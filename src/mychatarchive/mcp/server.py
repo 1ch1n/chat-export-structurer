@@ -522,8 +522,17 @@ def get_profile(
     return json.dumps(out, indent=2)
 
 
+# Default bind address for SSE transport: loopback-only. Binding every
+# interface is an explicit, caller-provided opt-in (CLI: `serve --host
+# <bind-all-address>`), never a hardcoded default -- a fixed bind-all literal
+# would bind every archive-serving process to the LAN whether or not the
+# operator wanted that.
+_DEFAULT_SSE_HOST = "127.0.0.1"
+
+
 def run(db_path: Path | None = None, transport: str = "stdio", port: int = 8420,
-        ssl_certfile: str | None = None, ssl_keyfile: str | None = None):
+        ssl_certfile: str | None = None, ssl_keyfile: str | None = None,
+        host: str | None = None):
     """Start the MCP server."""
     if db_path:
         global _con
@@ -531,20 +540,28 @@ def run(db_path: Path | None = None, transport: str = "stdio", port: int = 8420,
         _ensure_migrated(_con)
 
     if transport == "sse":
-        print(f"Starting MCP server with SSE transport on port {port}", file=sys.stderr)
+        bind_host = host or _DEFAULT_SSE_HOST
+        print(
+            f"Starting MCP server with SSE transport on {bind_host}:{port}",
+            file=sys.stderr,
+        )
         mcp.settings.port = port
+        mcp.settings.host = bind_host
         if ssl_certfile or ssl_keyfile:
             import anyio
             import uvicorn
 
-            # Disable localhost-only DNS rebinding protection so LAN clients can connect.
-            # Safe here because we're using a proper mkcert cert over HTTPS on a private LAN.
-            mcp.settings.transport_security.enable_dns_rebinding_protection = False
+            # Disable localhost-only DNS rebinding protection only when the
+            # caller explicitly asked for a non-loopback bind (CLI: --host
+            # <bind-all>) -- a proper mkcert cert over HTTPS on a private LAN
+            # is the intended use; the loopback-only default keeps it on.
+            if bind_host != _DEFAULT_SSE_HOST:
+                mcp.settings.transport_security.enable_dns_rebinding_protection = False
 
             async def _run():
                 config = uvicorn.Config(
                     mcp.sse_app(),
-                    host="0.0.0.0",
+                    host=bind_host,
                     port=port,
                     log_level=mcp.settings.log_level.lower(),
                     ssl_certfile=ssl_certfile,

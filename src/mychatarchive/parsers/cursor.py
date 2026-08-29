@@ -13,12 +13,15 @@ Cursor stores conversations in two SQLite databases:
 """
 
 import json
+import logging
 import os
 import platform
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator
+
+logger = logging.getLogger(__name__)
 
 
 def _default_cursor_dir() -> Path:
@@ -99,8 +102,8 @@ def _read_composers_from_global(global_db_path: Path) -> dict[str, dict]:
                     ws_data = json.load(f)
                 folder_uri = ws_data.get("folder", "")
                 workspace_folder = _uri_to_path(folder_uri)
-            except (json.JSONDecodeError, OSError):
-                pass
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.debug("Skipping unreadable workspace.json %s: %s", ws_json, exc)
 
         try:
             con = sqlite3.connect(f"file:{ws_db}?mode=ro", uri=True)
